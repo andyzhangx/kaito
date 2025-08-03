@@ -20,6 +20,8 @@ import yaml
 import copy
 from dataclasses import dataclass
 
+from lmcache.integration.vllm.utils import ENGINE_NAME
+from lmcache.v1.cache_engine import LMCacheEngineBuilder
 import psutil
 import uvloop
 import torch
@@ -285,4 +287,9 @@ if __name__ == "__main__":
     # - /v1/chat/completions
     # - /v1/completions
     # - /v1/embeddings
-    uvloop.run(api_server.run_server(args))
+    try:
+        uvloop.run(api_server.run_server(args))
+    finally:
+        if envs.VLLM_USE_V1:
+            logger.info("Destroying LMCacheEngineBuilder")
+            LMCacheEngineBuilder.destroy(ENGINE_NAME)
