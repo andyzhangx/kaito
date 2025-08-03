@@ -20,6 +20,7 @@ import yaml
 import copy
 from dataclasses import dataclass
 
+import psutil
 import uvloop
 import torch
 from vllm.config import KVTransferConfig
@@ -227,7 +228,12 @@ def try_get_max_available_seq_len(args: argparse.Namespace) -> Optional[int]:
     vllm_config = engine_args.create_engine_config()
 
     if envs.VLLM_USE_V1:
-        logger.info("VLLM_USE_V1 is set, Offload KV cache to CPU")
+        os.environ["LMCACHE_CHUNK_SIZE"] = "256"
+        os.environ["LMCACHE_LOCAL_CPU"] = "True"
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        logger.info(f"VLLM_USE_V1 is set, Offload KV cache to CPU RAM, size limit: {total_ram_gb * 0.5} GB")
+        os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = f"{total_ram_gb * 0.5}"
+
         ktc = KVTransferConfig(
             kv_connector="LMCacheConnectorV1",
             kv_role="kv_both",
@@ -254,13 +260,6 @@ def try_get_max_available_seq_len(args: argparse.Namespace) -> Optional[int]:
         return None
 
 if __name__ == "__main__":
-    # Set token chunk size to 256
-    os.environ["LMCACHE_CHUNK_SIZE"] = "256"
-    # Enable CPU memory backend
-    os.environ["LMCACHE_LOCAL_CPU"] = "True"
-    # Set CPU memory limit to 5GB
-    os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "5.0"
-
     parser = KAITOArgumentParser(description='KAITO wrapper of vLLM serving server')
     args = parser.parse_args()
 
