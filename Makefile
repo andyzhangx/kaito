@@ -7,6 +7,11 @@ GPU_PROVISIONER_VERSION ?= 0.3.6
 RAGENGINE_IMG_NAME ?= ragengine
 IMG_TAG ?= $(subst v,,$(VERSION))
 
+PROJ = github.com/kaito-project/kaito
+GIT_COMMIT ?= $(shell git rev-parse HEAD)
+BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+LDFLAGS ?= "-X ${PROJ}/cmd/workspace/main.driverVersion=${VERSION} -X ${PROJ}/cmd/workspace/main.gitCommit=${GIT_COMMIT} -X ${PROJ}/cmd/workspace/main.buildDate=${BUILD_DATE} -s -w -extldflags '-static'"
+
 ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 BIN_DIR := $(abspath $(ROOT_DIR)/bin)
 
@@ -294,6 +299,7 @@ docker-build-workspace: docker-buildx ## Build Docker image for workspace.
 		--platform="linux/$(ARCH)" \
 		--pull \
 		$(BUILD_FLAGS) \
+		--build-arg LDFLAGS=$(LDFLAGS) \
 		--tag $(REGISTRY)/$(IMG_NAME):$(IMG_TAG) .
 
 .PHONY: docker-build-ragengine

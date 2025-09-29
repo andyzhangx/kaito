@@ -57,6 +57,11 @@ const (
 )
 
 var (
+	// These are set during build time via -ldflags
+	driverVersion = "N/A"
+	gitCommit     = "N/A"
+	buildDate     = "N/A"
+
 	scheme = runtime.NewScheme()
 
 	exitWithErrorFunc = func() {
@@ -104,6 +109,7 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	klog.InfoS("starting workspace controller", "version", driverVersion, "commit", gitCommit, "buildDate", buildDate)
 
 	ctx := withShutdownSignal(context.Background())
 
