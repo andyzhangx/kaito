@@ -1,0 +1,38 @@
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: llm-pd-disagg
+  namespace: default
+resource:
+  instanceType: Standard_NC24ads_A100_v4
+  labelSelector:
+    matchLabels:
+      app: llm-pd-disagg
+inference:
+  preset:
+    name: "Qwen/Qwen3-32B"
+  disaggregatedServing:
+    enabled: true
+    # P/D disaggregation: dedicate pods for prefill and decode roles.
+    # Set both to 0 (or omit) for non-disaggregated KV-cache-aware routing.
+    prefillReplicas: 2
+    decodeReplicas: 3
+    scheduler:
+      # Must match vLLM --block-size (default 16)
+      blockSize: 16
+      # Must match vLLM PYTHONHASHSEED env var
+      hashSeed: "12345"
+      # When the best decode worker's uncached tokens are below this threshold,
+      # skip the prefill stage and route directly to the decode worker.
+      nonCachedTokenThreshold: 256
+      # ZMQ port for KV cache events (must match vLLM KVEventsConfig endpoint port)
+      kvEventsPort: 5557
+      # Speculative indexing prevents duplicate prefill work when multiple
+      # requests with overlapping prefixes arrive simultaneously.
+      enableSpeculativeIndexing: true
+      speculativeTTL: "2s"
+      scorers:
+        # Weight for precise-prefix-cache-scorer (KV cache locality)
+        prefixCacheWeight: 50
+        # Weight for load-aware-scorer (0 to disable)
+        loadAwareWeight: 10

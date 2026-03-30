@@ -103,6 +103,12 @@ type InferenceSpec struct {
 	// Users can specify multiple adapters for the model and the respective weight of using each of them.
 	// +optional
 	Adapters []AdapterSpec `json:"adapters,omitempty"`
+	// DisaggregatedServing configures Prefill/Decode disaggregated inference with
+	// llm-d scheduler integration. When enabled, the controller deploys an llm-d
+	// inference scheduler (EPP) that uses real-time KV cache events for precise
+	// prefix-cache-aware routing and P/D disaggregation bypass.
+	// +optional
+	DisaggregatedServing *DisaggregatedServingSpec `json:"disaggregatedServing,omitempty"`
 }
 
 type AdapterSpec struct {

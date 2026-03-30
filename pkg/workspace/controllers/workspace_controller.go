@@ -48,6 +48,7 @@ import (
 	"github.com/kaito-project/kaito/api/v1beta1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/featuregates"
+	"github.com/kaito-project/kaito/pkg/llmd"
 	pkgmodel "github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils"
 	"github.com/kaito-project/kaito/pkg/utils/consts"
@@ -231,6 +232,10 @@ func (c *WorkspaceReconciler) addOrUpdateWorkspace(ctx context.Context, wObj *ka
 			return reconcile.Result{}, err
 		}
 		if err := c.applyInference(ctx, wObj); err != nil {
+			return reconcile.Result{}, err
+		}
+		// Reconcile llm-d inference scheduler if disaggregated serving is enabled.
+		if err := c.ensureLlmdScheduler(ctx, wObj); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
@@ -510,6 +515,34 @@ func (c *WorkspaceReconciler) applyInference(ctx context.Context, wObj *kaitov1b
 
 	// Update it with the latest one generated above.
 	return c.Update(ctx, existingObj)
+}
+
+// ensureLlmdScheduler reconciles the llm-d inference scheduler resources
+// when disaggregated serving is enabled for the workspace.
+func (c *WorkspaceReconciler) ensureLlmdScheduler(ctx context.Context, wObj *kaitov1beta1.Workspace) error {
+	if wObj.Inference == nil ||
+		wObj.Inference.DisaggregatedServing == nil ||
+		!wObj.Inference.DisaggregatedServing.Enabled {
+		return nil
+	}
+
+	if !featuregates.FeatureGates[consts.FeatureFlagLlmdScheduler] {
+		klog.InfoS("llm-d scheduler feature gate is disabled, skipping",
+			"workspace", klog.KObj(wObj))
+		return nil
+	}
+
+	modelName := ""
+	if wObj.Inference.Preset != nil {
+		modelName = string(wObj.Inference.Preset.Name)
+	}
+	if modelName == "" {
+		klog.InfoS("No preset model name found, skipping llm-d scheduler",
+			"workspace", klog.KObj(wObj))
+		return nil
+	}
+
+	return llmd.EnsureLlmdScheduler(ctx, c.Client, wObj, modelName)
 }
 
 func (c *WorkspaceReconciler) syncWorkspaceStatus(ctx context.Context, key types.NamespacedName, reconcileErr error) error {

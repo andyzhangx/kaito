@@ -30,6 +30,7 @@ var (
 		consts.FeatureFlagDisableNodeAutoProvisioning:  false,
 		consts.FeatureFlagGatewayAPIInferenceExtension: false,
 		consts.FeatureFlagEnableInferenceSetController: false,
+		consts.FeatureFlagLlmdScheduler:                 false,
 		//	Add more feature gates here
 	}
 )
