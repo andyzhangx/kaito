@@ -30,7 +30,8 @@ COPY presets/workspace/dependencies/requirements.txt /workspace/requirements.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install --no-cache-dir "uv==${UV_VERSION}" && \
-    uv pip install --system -q -r /workspace/requirements.txt
+    uv pip install --system -q -r /workspace/requirements.txt && \
+    uv pip install --system -q llm-guard
 
 # 1. Huggingface transformers
 COPY presets/workspace/inference/${MODEL_TYPE}/inference_api.py \
@@ -43,6 +44,7 @@ COPY presets/workspace/inference/${MODEL_TYPE}/inference_api.py \
 
 # 2. vLLM
 COPY presets/workspace/inference/vllm/inference_api.py \
+    presets/workspace/inference/vllm/output_guardrails.py \
     presets/workspace/inference/vllm/multi-node-health-check.py \
     presets/workspace/inference/vllm/list_supported_llm_archs.py \
     presets/workspace/inference/vllm/benchmark_entrypoint.py \
