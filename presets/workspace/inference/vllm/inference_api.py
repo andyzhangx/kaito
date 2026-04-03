@@ -25,6 +25,8 @@ import yaml
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from output_guardrails import GuardrailsConfig, OutputGuardrails
+
 # Initialize logger
 logger = logging.getLogger(__name__)
 debug_mode = os.environ.get("DEBUG_MODE", "false").lower() == "true"
@@ -105,6 +107,8 @@ class KAITOArgumentParser(argparse.ArgumentParser):
                 kaito_args.kaito_kv_cache_cpu_memory_utilization = (
                     file_config.kv_cache_cpu_memory_utilization
                 )
+            # Store guardrails config for later initialization
+            kaito_args._kaito_guardrails_config = file_config.guardrails
 
             for key, value in file_config.vllm.items():
                 runtime_args.append(f"--{key}")
@@ -132,16 +136,21 @@ class KaitoConfig:
     # Optional: CPU memory utilization for the vllm engine in kv cache offload mode. (default: 0.5, set to 0 to disable)
     kv_cache_cpu_memory_utilization: float
 
+    # Output guardrails configuration
+    guardrails: GuardrailsConfig
+
     @staticmethod
     def from_yaml(yaml_file: str) -> "KaitoConfig":
         with open(yaml_file) as file:
             config_data = yaml.safe_load(file)
+        guardrails_data = config_data.get("guardrails", {})
         return KaitoConfig(
             vllm=config_data.get("vllm", {}),
             max_probe_steps=config_data.get("max_probe_steps", 6),
             kv_cache_cpu_memory_utilization=config_data.get(
                 "kv_cache_cpu_memory_utilization", 0.5
             ),
+            guardrails=GuardrailsConfig.from_dict(guardrails_data),
         )
 
     def to_yaml(self) -> str:
@@ -231,6 +240,13 @@ if __name__ == "__main__":
         args.lora_modules = load_lora_adapters(args.kaito_adapters_dir)
 
     set_kv_cache_offloading_if_appliable(args)
+
+    # Initialize output guardrails if configured
+    guardrails = None
+    if hasattr(args, "_kaito_guardrails_config"):
+        guardrails = OutputGuardrails.from_config(args._kaito_guardrails_config)
+        if guardrails.enabled:
+            logger.info("Output guardrails initialized and active.")
 
     # Run the serving server
     logger.info(f"Starting server on port {args.port}")
