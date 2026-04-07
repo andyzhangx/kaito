@@ -18,9 +18,14 @@ Integrates LLM Guard output scanners to filter/block potentially harmful
 LLM responses (e.g., malicious URLs, raw IPs, banned topics) before they
 reach the caller. Configured via the `guardrails` section in inference_config.yaml.
 
+For non-streaming requests, the full response is scanned before returning.
+For streaming (SSE) requests, tokens are buffered and scanned incrementally;
+if a scanner rejects the output, the stream is terminated with an error event.
+
 See: https://protectai.github.io/llm-guard/output_scanners/
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,6 +45,9 @@ _SCANNER_REGISTRY = {
     "Relevance": "llm_guard.output_scanners.Relevance",
 }
 
+# Default: scan every N characters accumulated (balances latency vs safety)
+_DEFAULT_STREAM_SCAN_INTERVAL = 200
+
 
 @dataclass
 class GuardrailsConfig:
@@ -47,12 +55,17 @@ class GuardrailsConfig:
 
     enabled: bool = False
     output_scanners: list[dict[str, Any]] = field(default_factory=list)
+    # How often to scan during streaming (in characters accumulated)
+    stream_scan_interval: int = _DEFAULT_STREAM_SCAN_INTERVAL
 
     @staticmethod
     def from_dict(config: dict[str, Any]) -> "GuardrailsConfig":
         return GuardrailsConfig(
             enabled=config.get("enabled", False),
             output_scanners=config.get("output_scanners", []),
+            stream_scan_interval=config.get(
+                "stream_scan_interval", _DEFAULT_STREAM_SCAN_INTERVAL
+            ),
         )
 
 
@@ -62,18 +75,23 @@ class OutputGuardrails:
 
     Usage:
         guardrails = OutputGuardrails.from_config(guardrails_config)
+        # Non-streaming
         sanitized, is_valid, results = guardrails.scan(prompt, response_text)
+        # Streaming
+        async for event in guardrails.scan_streaming(prompt, original_sse_generator):
+            yield event
     """
 
-    def __init__(self, scanners: list[Any]):
+    def __init__(self, scanners: list[Any], stream_scan_interval: int = _DEFAULT_STREAM_SCAN_INTERVAL):
         self.scanners = scanners
+        self.stream_scan_interval = stream_scan_interval
 
     @classmethod
     def from_config(cls, config: GuardrailsConfig) -> "OutputGuardrails":
         """Initialize guardrails from config. Returns a no-op instance if disabled."""
         if not config.enabled:
             logger.info("Output guardrails are disabled.")
-            return cls(scanners=[])
+            return cls(scanners=[], stream_scan_interval=config.stream_scan_interval)
 
         scanners = []
         for scanner_config in config.output_scanners:
@@ -88,7 +106,7 @@ class OutputGuardrails:
                 logger.info("Loaded output scanner: %s", scanner_name)
 
         logger.info("Output guardrails enabled with %d scanner(s).", len(scanners))
-        return cls(scanners=scanners)
+        return cls(scanners=scanners, stream_scan_interval=config.stream_scan_interval)
 
     @property
     def enabled(self) -> bool:
@@ -141,6 +159,148 @@ class OutputGuardrails:
                 })
 
         return sanitized, is_valid, scan_results
+
+    async def scan_streaming(self, prompt: str, sse_generator):
+        """
+        Wrap a vLLM SSE streaming generator with guardrails scanning.
+
+        Strategy: buffer SSE chunks and accumulate the generated text.
+        Periodically (every stream_scan_interval chars), run scanners on
+        the accumulated text. If blocked, yield an error SSE event and stop.
+        At stream end, do a final full-text scan.
+
+        Buffered chunks are held until the next scan checkpoint passes,
+        then flushed to the client. This adds latency equal to
+        ~stream_scan_interval characters of generation, but ensures no
+        harmful content is sent before scanning.
+
+        Args:
+            prompt: The original user prompt (for scanner context).
+            sse_generator: The original async generator of SSE byte lines
+                           from vLLM (each item is a bytes line like
+                           b'data: {...}\\n\\n').
+
+        Yields:
+            SSE byte lines — either the original chunks (if clean) or an
+            error event followed by stream termination.
+        """
+        if not self.scanners:
+            # No scanners — pass through untouched
+            async for chunk in sse_generator:
+                yield chunk
+            return
+
+        accumulated_text = ""
+        last_scanned_len = 0
+        buffered_chunks: list[bytes] = []
+        blocked = False
+
+        async for chunk in sse_generator:
+            if blocked:
+                break
+
+            buffered_chunks.append(chunk)
+
+            # Extract text delta from SSE data line
+            delta = _extract_text_delta(chunk)
+            if delta:
+                accumulated_text += delta
+
+            # Check if we should scan (enough new text accumulated)
+            new_text_len = len(accumulated_text) - last_scanned_len
+            if new_text_len >= self.stream_scan_interval:
+                _, is_valid, results = self.scan(prompt, accumulated_text)
+                last_scanned_len = len(accumulated_text)
+
+                if not is_valid:
+                    blocked = True
+                    logger.warning(
+                        "Streaming output blocked by guardrails at %d chars. "
+                        "Results: %s",
+                        len(accumulated_text),
+                        results,
+                    )
+                    # Yield error event to client
+                    yield _make_error_sse_event(
+                        "Response blocked by output guardrails."
+                    )
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                # Scan passed — flush buffered chunks to client
+                for buffered in buffered_chunks:
+                    yield buffered
+                buffered_chunks.clear()
+
+        if blocked:
+            return
+
+        # Final full-text scan on complete response
+        if accumulated_text:
+            _, is_valid, results = self.scan(prompt, accumulated_text)
+            if not is_valid:
+                logger.warning(
+                    "Streaming output blocked by guardrails at final scan. "
+                    "Results: %s",
+                    results,
+                )
+                yield _make_error_sse_event(
+                    "Response blocked by output guardrails."
+                )
+                yield b"data: [DONE]\n\n"
+                return
+
+        # All clean — flush remaining buffered chunks
+        for buffered in buffered_chunks:
+            yield buffered
+
+
+def _extract_text_delta(sse_chunk: bytes) -> str:
+    """
+    Extract the text content delta from an SSE data line.
+
+    vLLM SSE format:
+      data: {"id":"...","choices":[{"delta":{"content":"hello"},...}],...}
+
+    For /v1/completions:
+      data: {"id":"...","choices":[{"text":"hello",...}],...}
+
+    Returns the extracted text or empty string.
+    """
+    try:
+        line = sse_chunk.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data: "):
+            return ""
+        data_str = line[6:]  # Strip "data: " prefix
+        if data_str == "[DONE]":
+            return ""
+        data = json.loads(data_str)
+        choices = data.get("choices", [])
+        if not choices:
+            return ""
+        choice = choices[0]
+        # Chat completions streaming format
+        delta = choice.get("delta", {})
+        if "content" in delta and delta["content"]:
+            return delta["content"]
+        # Completions streaming format
+        if "text" in choice and choice["text"]:
+            return choice["text"]
+    except (json.JSONDecodeError, KeyError, IndexError, UnicodeDecodeError):
+        pass
+    return ""
+
+
+def _make_error_sse_event(message: str) -> bytes:
+    """Create an SSE error event in OpenAI-compatible format."""
+    error_data = {
+        "error": {
+            "message": message,
+            "type": "guardrails_violation",
+            "code": "content_blocked",
+        }
+    }
+    return f"data: {json.dumps(error_data)}\n\n".encode("utf-8")
 
 
 def _create_scanner(name: str, config: dict[str, Any]) -> Any:

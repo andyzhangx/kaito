@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -24,6 +25,9 @@ import vllm.entrypoints.openai.api_server as api_server
 import yaml
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, StreamingResponse
 
 from output_guardrails import GuardrailsConfig, OutputGuardrails
 
@@ -252,4 +256,161 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {args.port}")
     # See https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html for more
     # details about serving server.
-    uvloop.run(api_server.run_server(args))
+
+    async def _run_with_guardrails():
+        """Start vLLM server and inject guardrails middleware if enabled."""
+        async with api_server.build_async_engine_client(args) as engine_client:
+            app = api_server.build_app(args)
+
+            if guardrails and guardrails.enabled:
+                app = _add_guardrails_middleware(app, guardrails)
+                logger.info("Guardrails middleware injected into vLLM app.")
+
+            await api_server.run_server(args, app=app)
+
+    uvloop.run(_run_with_guardrails())
+
+
+def _add_guardrails_middleware(app, guardrails: OutputGuardrails):
+    """
+    Add guardrails scanning middleware to the FastAPI app.
+
+    Intercepts /v1/chat/completions and /v1/completions responses:
+    - Non-streaming: scans complete response, returns 400 if blocked.
+    - Streaming: wraps SSE generator with incremental scanning,
+      terminates stream with error event if blocked.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    GUARDED_PATHS = {"/v1/chat/completions", "/v1/completions"}
+
+    class GuardrailsMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if request.url.path not in GUARDED_PATHS:
+                return await call_next(request)
+
+            # Parse the request body to extract prompt for scanner context
+            try:
+                body = await request.body()
+                request_data = json.loads(body)
+            except (json.JSONDecodeError, Exception):
+                request_data = {}
+
+            prompt = _extract_prompt(request_data)
+            is_streaming = request_data.get("stream", False)
+
+            response = await call_next(request)
+
+            # Only process successful responses
+            if response.status_code != 200:
+                return response
+
+            if is_streaming:
+                return StreamingResponse(
+                    guardrails.scan_streaming(prompt, response.body_iterator),
+                    media_type="text/event-stream",
+                    headers=dict(response.headers),
+                )
+            else:
+                # Non-streaming: read full body, scan, return
+                body_bytes = b""
+                async for chunk in response.body_iterator:
+                    if isinstance(chunk, str):
+                        body_bytes += chunk.encode("utf-8")
+                    else:
+                        body_bytes += chunk
+
+                try:
+                    response_data = json.loads(body_bytes)
+                    output_text = _extract_output_text(response_data)
+                except (json.JSONDecodeError, Exception):
+                    # Can't parse — pass through
+                    return JSONResponse(
+                        content=json.loads(body_bytes) if body_bytes else {},
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                    )
+
+                if output_text:
+                    sanitized, is_valid, results = guardrails.scan(prompt, output_text)
+
+                    if not is_valid:
+                        logger.warning(
+                            "Non-streaming output blocked by guardrails. Results: %s",
+                            results,
+                        )
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": {
+                                    "message": "Response blocked by output guardrails.",
+                                    "type": "guardrails_violation",
+                                    "code": "content_blocked",
+                                    "scan_results": results,
+                                }
+                            },
+                        )
+
+                    # If sanitized text differs, update response
+                    if sanitized != output_text:
+                        _replace_output_text(response_data, sanitized)
+                        body_bytes = json.dumps(response_data).encode("utf-8")
+
+                return JSONResponse(
+                    content=response_data if isinstance(response_data, dict) else json.loads(body_bytes),
+                    status_code=response.status_code,
+                )
+
+    app.add_middleware(GuardrailsMiddleware)
+    return app
+
+
+def _extract_prompt(request_data: dict) -> str:
+    """Extract the user prompt from the request for scanner context."""
+    # Chat completions format
+    messages = request_data.get("messages", [])
+    if messages:
+        # Use the last user message as the prompt
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                # Handle list content (multimodal)
+                if isinstance(content, list):
+                    return " ".join(
+                        item.get("text", "")
+                        for item in content
+                        if item.get("type") == "text"
+                    )
+        return ""
+    # Completions format
+    return request_data.get("prompt", "")
+
+
+def _extract_output_text(response_data: dict) -> str:
+    """Extract the generated text from a non-streaming response."""
+    choices = response_data.get("choices", [])
+    if not choices:
+        return ""
+    choice = choices[0]
+    # Chat completions
+    message = choice.get("message", {})
+    if "content" in message and message["content"]:
+        return message["content"]
+    # Completions
+    if "text" in choice and choice["text"]:
+        return choice["text"]
+    return ""
+
+
+def _replace_output_text(response_data: dict, new_text: str) -> None:
+    """Replace the generated text in a non-streaming response with sanitized text."""
+    choices = response_data.get("choices", [])
+    if not choices:
+        return
+    choice = choices[0]
+    if "message" in choice and "content" in choice["message"]:
+        choice["message"]["content"] = new_text
+    elif "text" in choice:
+        choice["text"] = new_text
