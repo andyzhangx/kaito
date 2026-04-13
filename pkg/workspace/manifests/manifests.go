@@ -377,11 +377,22 @@ func GenerateInferencePoolHelmRelease(inferenceSetObj *kaitov1alpha1.InferenceSe
 	matchLabels[appsv1.PodIndexLabel] = "0"
 
 	// Based on https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v1.3.1/config/charts/inferencepool/values.yaml
+	eppImageHub := consts.GatewayAPIInferenceExtensionImageRepository
+	eppImageTag := consts.InferencePoolChartVersion
+	if epp := inferenceSetObj.Spec.EndpointPickerConfig; epp != nil {
+		if epp.Image != "" {
+			eppImageHub = epp.Image
+		}
+		if epp.Tag != "" {
+			eppImageTag = epp.Tag
+		}
+	}
+
 	helmValues := map[string]any{
 		"inferenceExtension": map[string]any{
 			"image": map[string]string{
-				"hub":        consts.GatewayAPIInferenceExtensionImageRepository,
-				"tag":        consts.InferencePoolChartVersion,
+				"hub":        eppImageHub,
+				"tag":        eppImageTag,
 				"pullPolicy": string(corev1.PullIfNotPresent),
 			},
 		},

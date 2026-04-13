@@ -59,6 +59,24 @@ type InferenceSetSpec struct {
 	// +kubebuilder:validation:Schemaless
 	// +kubebuilder:pruning:PreserveUnknownFields
 	UpdateStrategy appsv1.StatefulSetUpdateStrategy `json:"updateStrategy,omitempty"`
+	// EndpointPickerConfig allows customizing the Endpoint Picker (EPP) image
+	// used by the Gateway API Inference Extension InferencePool.
+	// When not specified, the default upstream GWIE EPP image is used.
+	// +optional
+	EndpointPickerConfig *EndpointPickerConfig `json:"endpointPickerConfig,omitempty"`
+}
+
+// EndpointPickerConfig allows overriding the EPP (Endpoint Picker) image
+// deployed by the InferencePool Helm chart.
+type EndpointPickerConfig struct {
+	// Image is the container image repository for the EPP.
+	// Example: "ghcr.io/llm-d/llm-d-inference-scheduler"
+	// +optional
+	Image string `json:"image,omitempty"`
+	// Tag is the image tag for the EPP.
+	// Example: "v0.5.0"
+	// +optional
+	Tag string `json:"tag,omitempty"`
 }
 
 // Metric holds an aggregated benchmark measurement across workspace replicas.
