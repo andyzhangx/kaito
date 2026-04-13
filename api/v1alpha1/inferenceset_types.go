@@ -15,6 +15,8 @@ package v1alpha1
 
 import (
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -67,7 +69,8 @@ type InferenceSetSpec struct {
 }
 
 // EndpointPickerConfig allows overriding the EPP (Endpoint Picker) image
-// deployed by the InferencePool Helm chart.
+// and configuration deployed by the InferencePool Helm chart.
+// This enables using alternative EPP implementations such as llm-d inference-scheduler.
 type EndpointPickerConfig struct {
 	// Image is the container image repository for the EPP.
 	// Example: "ghcr.io/llm-d/llm-d-inference-scheduler"
@@ -77,6 +80,21 @@ type EndpointPickerConfig struct {
 	// Example: "v0.5.0"
 	// +optional
 	Tag string `json:"tag,omitempty"`
+	// ExtraArgs are additional command-line arguments passed to the EPP container.
+	// Example: ["--configFile=/etc/scheduler/config.yaml", "--logLevel=debug"]
+	// +optional
+	ExtraArgs []string `json:"extraArgs,omitempty"`
+	// ExtraEnv are additional environment variables set on the EPP container.
+	// +optional
+	ExtraEnv []corev1.EnvVar `json:"extraEnv,omitempty"`
+	// SchedulerConfig is an inline scheduler configuration that will be mounted
+	// as a ConfigMap at /etc/scheduler/config.yaml in the EPP container.
+	// This is typically used with llm-d inference-scheduler to define
+	// filter/scorer plugins and scheduling profiles.
+	// +optional
+	// +kubebuilder:validation:Schemaless
+	// +kubebuilder:pruning:PreserveUnknownFields
+	SchedulerConfig *apiextensionsv1.JSON `json:"schedulerConfig,omitempty"`
 }
 
 // Metric holds an aggregated benchmark measurement across workspace replicas.

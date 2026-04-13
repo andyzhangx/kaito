@@ -379,7 +379,8 @@ func GenerateInferencePoolHelmRelease(inferenceSetObj *kaitov1alpha1.InferenceSe
 	// Based on https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/v1.3.1/config/charts/inferencepool/values.yaml
 	eppImageHub := consts.GatewayAPIInferenceExtensionImageRepository
 	eppImageTag := consts.InferencePoolChartVersion
-	if epp := inferenceSetObj.Spec.EndpointPickerConfig; epp != nil {
+	epp := inferenceSetObj.Spec.EndpointPickerConfig
+	if epp != nil {
 		if epp.Image != "" {
 			eppImageHub = epp.Image
 		}
@@ -388,14 +389,51 @@ func GenerateInferencePoolHelmRelease(inferenceSetObj *kaitov1alpha1.InferenceSe
 		}
 	}
 
-	helmValues := map[string]any{
-		"inferenceExtension": map[string]any{
-			"image": map[string]string{
-				"hub":        eppImageHub,
-				"tag":        eppImageTag,
-				"pullPolicy": string(corev1.PullIfNotPresent),
-			},
+	inferenceExtension := map[string]any{
+		"image": map[string]string{
+			"hub":        eppImageHub,
+			"tag":        eppImageTag,
+			"pullPolicy": string(corev1.PullIfNotPresent),
 		},
+	}
+
+	// Pass extra arguments to EPP container (e.g., --configFile for llm-d scheduler config)
+	if epp != nil && len(epp.ExtraArgs) > 0 {
+		inferenceExtension["args"] = epp.ExtraArgs
+	}
+
+	// Pass extra environment variables to EPP container (e.g., TOKENIZER_PATH, KV_BLOCK_SIZE)
+	if epp != nil && len(epp.ExtraEnv) > 0 {
+		envVars := make([]map[string]any, 0, len(epp.ExtraEnv))
+		for _, env := range epp.ExtraEnv {
+			e := map[string]any{"name": env.Name, "value": env.Value}
+			envVars = append(envVars, e)
+		}
+		inferenceExtension["env"] = envVars
+	}
+
+	// Mount scheduler config ConfigMap if schedulerConfig is specified
+	if epp != nil && epp.SchedulerConfig != nil {
+		configMapName := utils.InferencePoolName(inferenceSetObj.Name) + "-scheduler-config"
+		inferenceExtension["volumeMounts"] = []map[string]any{
+			{
+				"name":      "scheduler-config",
+				"mountPath": "/etc/scheduler",
+				"readOnly":  true,
+			},
+		}
+		inferenceExtension["volumes"] = []map[string]any{
+			{
+				"name": "scheduler-config",
+				"configMap": map[string]any{
+					"name": configMapName,
+				},
+			},
+		}
+	}
+
+	helmValues := map[string]any{
+		"inferenceExtension": inferenceExtension,
 		"inferencePool": map[string]any{
 			"targetPorts": []map[string]any{{
 				"number": consts.PortInferenceServer,
@@ -430,4 +468,27 @@ func GenerateInferencePoolHelmRelease(inferenceSetObj *kaitov1alpha1.InferenceSe
 			},
 		},
 	}, nil
+}
+
+// GenerateSchedulerConfigMap creates a ConfigMap containing the EPP scheduler configuration.
+// This is used by llm-d inference-scheduler to define filter/scorer plugins and scheduling profiles.
+// The ConfigMap is mounted at /etc/scheduler/config.yaml in the EPP container.
+func GenerateSchedulerConfigMap(inferenceSetObj *kaitov1alpha1.InferenceSet) *corev1.ConfigMap {
+	epp := inferenceSetObj.Spec.EndpointPickerConfig
+	if epp == nil || epp.SchedulerConfig == nil {
+		return nil
+	}
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      utils.InferencePoolName(inferenceSetObj.Name) + "-scheduler-config",
+			Namespace: inferenceSetObj.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(inferenceSetObj, kaitov1alpha1.GroupVersion.WithKind("InferenceSet")),
+			},
+		},
+		Data: map[string]string{
+			"config.yaml": string(epp.SchedulerConfig.Raw),
+		},
+	}
 }

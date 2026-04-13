@@ -26,6 +26,7 @@ import (
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -437,6 +438,27 @@ func (c *InferenceSetReconciler) ensureGatewayAPIInferenceExtension(ctx context.
 	helmRelease, err := manifests.GenerateInferencePoolHelmRelease(iObj)
 	if err != nil {
 		return err
+	}
+
+	// Create or update scheduler ConfigMap if schedulerConfig is specified
+	if cm := manifests.GenerateSchedulerConfigMap(iObj); cm != nil {
+		existingCM := &corev1.ConfigMap{}
+		err = resources.GetResource(ctx, cm.Name, cm.Namespace, c.Client, existingCM)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			if err := resources.CreateResource(ctx, cm, c.Client); client.IgnoreAlreadyExists(err) != nil {
+				return err
+			}
+		} else {
+			if existingCM.Data["config.yaml"] != cm.Data["config.yaml"] {
+				existingCM.Data = cm.Data
+				if err := c.Update(ctx, existingCM); err != nil {
+					return err
+				}
+			}
+		}
 	}
 
 	// Create or update OCIRepository
