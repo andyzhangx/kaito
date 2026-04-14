@@ -14,6 +14,8 @@ Gateway API Inference Extension extends [Gateway API](https://gateway-api.sigs.k
 
 KAITO uses GWIE to route requests for models to the right Workspace pods, improving latency and GPU utilization.
 
+KAITO also supports using a custom EPP implementation (such as [llm-d inference-scheduler](https://github.com/llm-d/llm-d-inference-scheduler)) in place of the default reference EPP. See [Using a Custom EPP](#using-a-custom-epp-eg-llm-d) for details.
+
 ## Prerequisites
 
 Before enabling this feature in KAITO, ensure the following are installed in your cluster:
@@ -399,3 +401,70 @@ kubectl run -it --rm --restart=Never curl --image=curlimages/curl -- curl -X POS
   }
 }
 ```
+
+## Using a Custom EPP (e.g., llm-d)
+
+By default, KAITO deploys the upstream GWIE reference EPP. You can replace it with an alternative EPP implementation by configuring the `endpointPickerConfig` field in the InferenceSet spec. This is useful for deploying advanced endpoint pickers such as [llm-d inference-scheduler](https://github.com/llm-d/llm-d-inference-scheduler), which provides prefix-cache-aware routing, load-aware scoring, LoRA affinity, and disaggregated prefill/decode scheduling.
+
+### EndpointPickerConfig Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `image` | string | Container image repository for the EPP. Default: upstream GWIE EPP image. |
+| `tag` | string | Image tag for the EPP. Default: InferencePool chart version. |
+| `extraArgs` | []string | Additional command-line arguments passed to the EPP container. |
+| `extraEnv` | []EnvVar | Additional environment variables set on the EPP container. |
+| `schedulerConfig` | object | Inline scheduler configuration YAML. When specified, KAITO creates a ConfigMap and mounts it at `/etc/scheduler/config.yaml` in the EPP container. |
+
+### Example: Using llm-d inference-scheduler
+
+```yaml
+apiVersion: kaito.sh/v1alpha1
+kind: InferenceSet
+metadata:
+  name: phi-4-mini
+  annotations:
+    kaito.sh/enablelb: "False"
+spec:
+  replicas: 1
+  endpointPickerConfig:
+    image: ghcr.io/llm-d/llm-d-inference-scheduler
+    tag: latest
+    extraArgs:
+      - "--configFile=/etc/scheduler/config.yaml"
+    extraEnv:
+      - name: TOKENIZER_PATH
+        value: /workspace/vllm/weights
+    schedulerConfig:
+      profiles:
+        - name: default
+          plugins:
+            filter:
+              - name: health
+              - name: prefix-cache
+            scorer:
+              - name: kv-cache-utilization
+                weight: 60
+              - name: queue-depth
+                weight: 40
+  template:
+    inference:
+      preset:
+        presetMeta:
+          name: phi-4-mini-instruct
+```
+
+All other setup steps (Gateway, HTTPRoute, DestinationRule, BBR) remain the same as the [Quickstart](#quickstart), because llm-d inference-scheduler implements the same GWIE ext-proc protocol.
+
+### Why use llm-d over the default EPP?
+
+The default GWIE EPP provides basic load balancing based on queue depth and KV cache utilization. llm-d inference-scheduler extends this with:
+
+- **Prefix cache-aware routing**: Routes similar prompts to the same node to maximize KV cache reuse.
+- **Plugin-based architecture**: Composable filter/scorer pipeline configured via scheduling profiles.
+- **LoRA affinity**: Co-locates requests using the same LoRA adapter.
+- **Session affinity**: Routes multi-turn conversations to the same pod.
+- **Disaggregated prefill/decode**: Splits prefill and decode phases across different pod groups for improved throughput.
+- **Warm-model autoscaling signals**: Provides KV cache pressure metrics for more accurate scaling decisions.
+
+For single-model deployments with a few replicas, the default EPP is sufficient. For large-scale inference with long contexts, multiple LoRA adapters, or prefix cache optimization, llm-d is recommended.
