@@ -214,6 +214,8 @@ type HuggingfaceTransformersParam struct {
 	ModelRunParams    map[string]string // Parameters for running the model training/inference.
 	// The model name used in the OpenAI serving API.
 	ModelName string
+	// Tag is the ORAS image tag for pre-built model weights.
+	Tag string
 }
 
 type VLLMParam struct {
@@ -402,6 +404,9 @@ func (p *PresetParam) configureParallelism(rc RuntimeContext) {
 	if !multiNode && p.modelFitsOnSingleGPU(rc) {
 		p.VLLM.ModelRunParams["data-parallel-size"] = strconv.Itoa(rc.SKUNumGPUs)
 		p.VLLM.ModelRunParams["tensor-parallel-size"] = "1"
+		// In this branch, data-parallel-size is guaranteed to be > 1; disable kv cache CPU offloading
+		// due to conflicts between data parallelism and CPU offloading.
+		p.VLLM.ModelRunParams["kaito-kv-cache-cpu-memory-utilization"] = "0"
 		return
 	}
 
@@ -489,6 +494,10 @@ func (p *PresetParam) modelFitsOnSingleGPU(rc RuntimeContext) bool {
 func (p *PresetParam) Validate(rc RuntimeContext) error {
 	var errs []string
 	switch rc.RuntimeName {
+	case RuntimeNameHuggingfaceTransformers:
+		if p.Transformers.BaseCommand == "" {
+			errs = append(errs, fmt.Sprintf("model %s does not support inference with Huggingface Transformers runtime", p.Metadata.Name))
+		}
 	case RuntimeNameVLLM:
 		if rc.AdaptersEnabled && p.VLLM.DisallowLoRA {
 			errs = append(errs, fmt.Sprintf("vLLM does not support LoRA adapters for this model: %s", p.VLLM.ModelName))

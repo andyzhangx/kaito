@@ -18,7 +18,6 @@ import (
 
 	"github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils/plugin"
-	"github.com/kaito-project/kaito/pkg/workspace/inference"
 	metadata "github.com/kaito-project/kaito/presets/workspace/models"
 )
 
@@ -40,18 +39,6 @@ const (
 	PresetGPT_OSS_120BModel = "gpt-oss-120b"
 )
 
-var (
-	baseCommandPresetGPTInference = "accelerate launch"
-	// GPT-OSS uses the Harmony chat format and provides its own chat template in the repo.
-	// We enable allow_remote_files so Transformers can fetch it when needed.
-	gptRunParams = map[string]string{
-		"torch_dtype":        "auto",
-		"pipeline":           "text-generation",
-		"allow_remote_files": "",
-	}
-	gptRunParamsVLLM = map[string]string{} // TODO: add the dtype to the gpt model
-)
-
 var gptOss20b gpt_oss_20B
 var gptOss120b gpt_oss_120B
 
@@ -67,18 +54,8 @@ func (*gpt_oss_20B) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           34560,
 		ModelTokenLimit:         131072, // max_position_embeddings from HF config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetGPTInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    gptRunParams,
-				ModelName:         PresetGPT_OSS_20BModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetGPT_OSS_20BModel,
-				ModelRunParams: gptRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetGPT_OSS_20BModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetGPT_OSS_20BModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -107,18 +84,8 @@ func (*gpt_oss_120B) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           51840,
 		ModelTokenLimit:         131072, // max_position_embeddings from HF config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetGPTInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    gptRunParams,
-				ModelName:         PresetGPT_OSS_120BModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetGPT_OSS_120BModel,
-				ModelRunParams: gptRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetGPT_OSS_120BModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetGPT_OSS_120BModel],
 		},
 		ReadinessTimeout: time.Duration(45) * time.Minute, // Longer timeout for larger model
 	}

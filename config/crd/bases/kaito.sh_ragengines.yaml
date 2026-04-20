@@ -179,6 +179,10 @@ spec:
                   to generate embeddings. If not specified, a default service name will be created by the RAG engine.
                 type: string
               inferenceService:
+                description: |-
+                  InferenceService specifies the endpoint of the LLM inference service for generating responses.
+                  This field is optional - if not specified, the RAG engine operates in retrieve-only mode,
+                  supporting pure document search via the /retrieve API without LLM-based response generation.
                 properties:
                   accessSecret:
                     description: AccessSecret is the name of the secret that contains
@@ -230,7 +234,6 @@ spec:
                 type: object
             required:
             - embedding
-            - inferenceService
             type: object
           status:
             description: RAGEngineStatus defines the observed state of RAGEngine
@@ -459,6 +462,10 @@ spec:
                     type: object
                 type: object
               inferenceService:
+                description: |-
+                  InferenceService specifies the endpoint of the LLM inference service for generating responses.
+                  This field is optional - if not specified, the RAG engine operates in retrieve-only mode,
+                  supporting pure document search via the /retrieve API without LLM-based response generation.
                 properties:
                   accessSecret:
                     description: AccessSecret is the name of the secret that contains
@@ -538,7 +545,6 @@ spec:
                 type: object
             required:
             - embedding
-            - inferenceService
             type: object
           status:
             description: RAGEngineStatus defines the observed state of RAGEngine

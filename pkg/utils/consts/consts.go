@@ -54,6 +54,13 @@ const (
 	ErrorInstanceTypesUnavailable = "all requested instance types were unavailable during launch"
 	NodeClassName                 = "default"
 
+	// Karpenter provisioner related consts
+	KarpenterLabelManagedBy    = "karpenter.kaito.sh/managed-by"
+	KarpenterManagedByValue    = "kaito"
+	AKSNodeClassUbuntuName     = "image-family-ubuntu"
+	AKSNodeClassAzureLinuxName = "image-family-azure-linux"
+	AKSNodeClassOSDiskSizeGB   = 300
+
 	// machine related consts
 	ProvisionerName           = "default"
 	LabelGPUProvisionerCustom = "kaito.sh/machine-type"
@@ -90,6 +97,8 @@ const (
 
 	NodeImageFamilyUbuntu     = "ubuntu"
 	NodeImageFamilyAzureLinux = "azurelinux"
+	SpotInstanceKey           = "kubernetes.azure.com/scalesetpriority"
+	SpotInstanceValue         = "spot"
 )
 
 var (

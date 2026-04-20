@@ -18,7 +18,6 @@ import (
 
 	"github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils/plugin"
-	"github.com/kaito-project/kaito/pkg/workspace/inference"
 	metadata "github.com/kaito-project/kaito/presets/workspace/models"
 )
 
@@ -59,27 +58,6 @@ const (
 	PresetMistralLarge3675BInstructModel = "mistral-large-3-675b-instruct"
 )
 
-var (
-	baseCommandPresetMistralInference = "accelerate launch"
-	baseCommandPresetMistralTuning    = "cd /workspace/tfs/ && python3 metrics_server.py & accelerate launch"
-	mistralRunParams                  = map[string]string{
-		"torch_dtype":   "bfloat16",
-		"pipeline":      "text-generation",
-		"chat_template": "/workspace/chat_templates/mistral-instruct.jinja",
-	}
-	mistralRunParamsVLLM = map[string]string{
-		"tool-call-parser":        "mistral",
-		"enable-auto-tool-choice": "",
-	}
-	mistral3RunParamsVLLM = map[string]string{
-		"tool-call-parser":        "mistral",
-		"tokenizer_mode":          "mistral",
-		"config_format":           "mistral",
-		"load_format":             "mistral",
-		"enable-auto-tool-choice": "",
-	}
-)
-
 var mistralA mistral7b
 
 type mistral7b struct{}
@@ -93,38 +71,27 @@ func (*mistral7b) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           131072,
 		ModelTokenLimit:         32768, // max_position_embeddings from HF config (v0.1/0.2)
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMistral7BModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetMistral7BModel,
-				ModelRunParams: mistralRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMistral7BModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMistral7BModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
 
 }
 func (*mistral7b) GetTuningParameters() *model.PresetParam {
+	tc := metadata.TransformerTuningParameters[PresetMistral7BModel]
 	return &model.PresetParam{
-		Metadata:                metadata.MustGet(PresetMistral7BModel),
-		DiskStorageRequirement:  "90Gi",
-		GPUCountRequirement:     "1",
-		TotalSafeTensorFileSize: "16Gi",
+		Metadata:                      metadata.MustGet(PresetMistral7BModel),
+		DiskStorageRequirement:        tc.DiskStorageRequirement,
+		GPUCountRequirement:           tc.GPUCountRequirement,
+		TotalSafeTensorFileSize:       tc.TotalSafeTensorFileSize,
+		ModelTokenLimit:               tc.ModelTokenLimit,
+		BytesPerToken:                 tc.BytesPerToken,
+		TuningPerGPUMemoryRequirement: tc.TuningPerGPUMemoryRequirement,
+		ReadinessTimeout:              tc.ReadinessTimeout,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				// AccelerateParams: tuning.DefaultAccelerateParams,
-				// ModelRunParams:   mistralRunParams,
-				BaseCommand: baseCommandPresetMistralTuning,
-				ModelName:   PresetMistral7BModel,
-			},
+			Transformers: tc.Transformers,
 		},
-		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
 }
 
@@ -148,18 +115,8 @@ func (*mistral7bInst) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           131072,
 		ModelTokenLimit:         32768, // max_position_embeddings from HF config (v0.2)
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMistral7BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetMistral7BInstructModel,
-				ModelRunParams: mistralRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMistral7BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMistral7BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -191,18 +148,8 @@ func (*ministral3_3bInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           106496,
 		ModelTokenLimit:         262144,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMinistral33BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetMinistral33BInstructModel,
-				ModelRunParams: mistral3RunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMinistral33BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMinistral33BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -222,18 +169,8 @@ func (*ministral3_8bInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           139264,
 		ModelTokenLimit:         262144,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMinistral38BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetMinistral38BInstructModel,
-				ModelRunParams: mistral3RunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMinistral38BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMinistral38BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -253,18 +190,8 @@ func (*ministral3_14bInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           163840,
 		ModelTokenLimit:         262144,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMinistral314BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetMinistral314BInstructModel,
-				ModelRunParams: mistral3RunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMinistral314BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMinistral314BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -286,20 +213,8 @@ func (*mistralLarge3_675bInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:   70272,
 		ModelTokenLimit: 262144,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				ModelRunParams:    mistralRunParams,
-				BaseCommand:       baseCommandPresetMistralInference,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelName:         PresetMistralLarge3675BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:          metadata.DefaultVLLMCommand,
-				ModelName:            PresetMistralLarge3675BInstructModel,
-				ModelRunParams:       mistral3RunParamsVLLM,
-				RayLeaderBaseCommand: metadata.DefaultVLLMRayLeaderBaseCommand,
-				RayWorkerBaseCommand: metadata.DefaultVLLMRayWorkerBaseCommand,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetMistralLarge3675BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetMistralLarge3675BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(60) * time.Minute,
 	}

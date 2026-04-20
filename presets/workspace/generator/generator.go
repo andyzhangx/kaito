@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -26,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v2"
 
 	"github.com/kaito-project/kaito/pkg/model"
 )
@@ -40,7 +41,7 @@ var (
 	safetensorRegex = regexp.MustCompile(`.*\.safetensors`)
 	binRegex        = regexp.MustCompile(`.*\.bin`)
 	mistralRegex    = regexp.MustCompile(`consolidated.*\.safetensors`)
-	// source: https://github.com/vllm-project/vllm/blob/main/docs/features/reasoning_outputs.md
+	// source: https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/reasoning/__init__.py
 	reasoningParserModeNamePrefixMap = map[string]string{
 		"deepseek-r1":  "deepseek_r1",
 		"deepseek-v3":  "deepseek_v3",
@@ -49,9 +50,12 @@ var (
 		"holo2":        "holo2",
 		"hunyuan-a13b": "hunyuan_a13b",
 		"granite-3.2":  "granite",
+		"kimi-k2":      "kimi_k2",
 		"minimax-m2":   "minimax_m2_append_think",
+		"olmo-3":       "olmo3",
 		"qwen3":        "qwen3",
 		"qwq-32b":      "deepseek_r1",
+		"step3":        "step3",
 	}
 	reasoningParserArchMap = map[string]string{
 		"DeepseekV3ForCausalLM":                  "deepseek_v3",
@@ -60,7 +64,11 @@ var (
 		"Glm4MoeForCausalLM":                     "glm45",
 		"HunYuanMoEV1ForCausalLM":                "hunyuan_a13b",
 		"GraniteForCausalLM":                     "granite",
+		"KimiK2ForCausalLM":                      "kimi_k2",
 		"MiniMaxM2ForCausalLM":                   "minimax_m2_append_think",
+		"MistralForCausalLM":                     "mistral",
+		"NemotronForCausalLM":                    "nemotron_v3",
+		"OlmoForCausalLM":                        "olmo3",
 		"Qwen3ForCausalLM":                       "qwen3",
 		"Qwen3MoeForCausalLM":                    "qwen3",
 		"GptOssForCausalLM":                      "openai_gptoss",
@@ -99,6 +107,11 @@ var (
 		"olmo-3":        "olmo3",
 		"gigachat3":     "gigachat3",
 		"ernie-4.5":     "ernie45",
+		"phi4-mini":     "phi4_mini_json",
+		"step3p5":       "step3p5",
+		"step3":         "step3",
+		"seed-oss":      "seed_oss",
+		"gemma-3":       "functiongemma",
 	}
 
 	// key is model architecture name, value is ToolCallParser mode name
@@ -124,19 +137,25 @@ var (
 		"HunYuanMoEV1ForCausalLM":                "hunyuan_a13b",
 		"LongcatFlashForCausalLM":                "longcat",
 		"Glm4MoeForCausalLM":                     "glm45",
+		"Glm47MoeForCausalLM":                    "glm47",
 		"Gemma3ForCausalLM":                      "functiongemma",
 		"Olmo3ForCausalLM":                       "olmo3",
 		"SeedOssForCausalLM":                     "seed_oss",
 		"Ernie4_5_VLMoeForConditionalGeneration": "ernie45",
 		"Ernie4_5_MoeForCausalLM":                "ernie45",
 		"Step3TextForCausalLM":                   "step3",
+		"Step3p5TextForCausalLM":                 "step3p5",
+		"Phi4MiniForCausalLM":                    "phi4_mini_json",
+		"KimiK2ForCausalLM":                      "kimi_k2",
+		"GigaChat3ForCausalLM":                   "gigachat3",
 	}
 )
 
 type Generator struct {
-	ModelRepo string
-	Token     string
-	Param     model.PresetParam
+	ModelRepo   string
+	Token       string
+	Param       model.PresetParam
+	CatalogData []byte // Optional embedded catalog YAML
 
 	// Analyzed params
 	LoadFormat    string
@@ -217,77 +236,99 @@ type FileInfo struct {
 }
 
 func (g *Generator) FetchModelMetadata() error {
-	// List files using HF API
+	files, err := g.listRepoFiles()
+	if err != nil {
+		return err
+	}
+
+	selectedFiles, hasMistralWeights := g.selectWeightFiles(files)
+	if len(selectedFiles) == 0 {
+		return fmt.Errorf("no .safetensors or .bin files found")
+	}
+
+	if hasMistralWeights {
+		g.setMistralMode()
+	}
+
+	g.Param.Metadata.ModelFileSize = calculateModelFileSize(selectedFiles)
+	g.Param.VLLM.ModelRunParams = make(map[string]string)
+
+	if err := g.fetchAndParseConfig(hasMistralWeights); err != nil {
+		return err
+	}
+
+	g.mergeTextConfig()
+	return nil
+}
+
+// listRepoFiles fetches the full file tree for the model repo from HuggingFace.
+func (g *Generator) listRepoFiles() ([]FileInfo, error) {
 	url := fmt.Sprintf("%s/api/models/%s/tree/main?recursive=true", HuggingFaceWebsite, g.ModelRepo)
 	body, err := g.fetchURL(url)
 	if err != nil {
-		return fmt.Errorf("error listing files: %v", err)
+		return nil, fmt.Errorf("error listing files: %v", err)
 	}
 
 	var files []FileInfo
 	if err := json.Unmarshal(body, &files); err != nil {
-		return fmt.Errorf("error parsing file list: %v", err)
+		return nil, fmt.Errorf("error parsing file list: %v", err)
 	}
+	return files, nil
+}
 
-	// Filter files
-	var selectedFiles []FileInfo
-	var mistralFiles []FileInfo
+// selectWeightFiles picks the model weight files to use and detects whether
+// the model uses Mistral format. For Mistral-format models (those with
+// consolidated*.safetensors), it sets the load/config/tokenizer modes and
+// returns only the consolidated files. For standard models, it prefers
+// .safetensors over .bin when both are present.
+func (g *Generator) selectWeightFiles(files []FileInfo) (selected []FileInfo, isMistral bool) {
+	var safetensors, bins, mistral []FileInfo
 
 	for _, f := range files {
 		if mistralRegex.MatchString(f.Path) {
-			mistralFiles = append(mistralFiles, f)
+			mistral = append(mistral, f)
 		}
-		if safetensorRegex.MatchString(f.Path) || binRegex.MatchString(f.Path) {
-			selectedFiles = append(selectedFiles, f)
+		if safetensorRegex.MatchString(f.Path) {
+			safetensors = append(safetensors, f)
+		} else if binRegex.MatchString(f.Path) {
+			bins = append(bins, f)
 		}
 	}
 
-	var configFile string
-
-	// Logic to detect model format
-	if len(mistralFiles) > 0 {
-		g.LoadFormat = "mistral"
-		g.ConfigFormat = "mistral"
-		g.TokenizerMode = "mistral"
-		configFile = "params.json"
-		selectedFiles = mistralFiles
-	} else if len(selectedFiles) > 0 {
-		configFile = "config.json"
-
-		// Prefer safetensors if mixed with bin
-		hasSafetensors := false
-		for _, f := range selectedFiles {
-			if strings.HasSuffix(f.Path, ".safetensors") {
-				hasSafetensors = true
-				break
-			}
-		}
-
-		if hasSafetensors {
-			var onlySafetensors []FileInfo
-			for _, f := range selectedFiles {
-				if strings.HasSuffix(f.Path, ".safetensors") {
-					onlySafetensors = append(onlySafetensors, f)
-				}
-			}
-			selectedFiles = onlySafetensors
-		}
-	} else {
-		return fmt.Errorf("no .safetensors or .bin files found")
+	if len(mistral) > 0 {
+		return mistral, true
 	}
 
+	// Prefer safetensors over bin files when both exist.
+	if len(safetensors) > 0 {
+		return safetensors, false
+	}
+	return bins, false
+}
+
+func (g *Generator) setMistralMode() {
+	g.LoadFormat = "mistral"
+	g.ConfigFormat = "mistral"
+	g.TokenizerMode = "mistral"
+}
+
+func calculateModelFileSize(files []FileInfo) string {
 	var totalBytes int64
-	for _, f := range selectedFiles {
+	for _, f := range files {
 		totalBytes += f.Size
 	}
+	sizeGiB := float64(totalBytes) / (1024 * 1024 * 1024)
+	return fmt.Sprintf("%.2fGi", sizeGiB)
+}
 
-	modelSizeGB := float64(totalBytes) / (1024 * 1024 * 1024)
-	g.Param.Metadata.ModelFileSize = fmt.Sprintf("%.0fGi", math.Ceil(modelSizeGB))
-
-	g.Param.VLLM.ModelRunParams = make(map[string]string)
-
-	configURL := fmt.Sprintf("%s/%s/resolve/main/%s", HuggingFaceWebsite, g.ModelRepo, configFile)
-	configBody, err := g.fetchURL(configURL)
+// fetchAndParseConfig downloads and parses the model's config.json. For
+// Mistral-format models, it falls back to params.json if config.json is absent.
+func (g *Generator) fetchAndParseConfig(hasMistralWeights bool) error {
+	configBody, err := g.fetchConfigFile("config.json")
+	if err != nil && hasMistralWeights {
+		// config.json not available; fall back to params.json (Mistral native format).
+		configBody, err = g.fetchConfigFile("params.json")
+	}
 	if err != nil {
 		return fmt.Errorf("error fetching config: %v", err)
 	}
@@ -295,8 +336,27 @@ func (g *Generator) FetchModelMetadata() error {
 	if err := json.Unmarshal(configBody, &g.ModelConfig); err != nil {
 		return fmt.Errorf("error parsing config: %v", err)
 	}
-
 	return nil
+}
+
+func (g *Generator) fetchConfigFile(name string) ([]byte, error) {
+	url := fmt.Sprintf("%s/%s/resolve/main/%s", HuggingFaceWebsite, g.ModelRepo, name)
+	return g.fetchURL(url)
+}
+
+// mergeTextConfig promotes fields from a nested "text_config" object into the
+// top-level config. This is needed for multimodal models (e.g., Gemma-3,
+// Ministral-3) where architecture-specific parameters live under text_config.
+func (g *Generator) mergeTextConfig() {
+	textConfig, ok := g.ModelConfig["text_config"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for k, v := range textConfig {
+		if _, exists := g.ModelConfig[k]; !exists {
+			g.ModelConfig[k] = v
+		}
+	}
 }
 
 func getInt(config map[string]interface{}, keys []string, defaultVal int) int {
@@ -318,13 +378,7 @@ func getInt(config map[string]interface{}, keys []string, defaultVal int) int {
 }
 
 func (g *Generator) ParseModelMetadata() {
-	maxPos := getInt(g.ModelConfig, []string{
-		"max_position_embeddings",
-		"n_ctx",
-		"seq_length",
-		"max_seq_len",
-		"max_sequence_length",
-	}, DefaultModelTokenLimit)
+	maxPos := getInt(g.ModelConfig, configKeyMap["modelTokenLimit"], DefaultModelTokenLimit)
 
 	g.Param.Metadata.ModelTokenLimit = maxPos
 
@@ -401,19 +455,19 @@ func (g *Generator) calculateStorageSize() string {
 func (g *Generator) calculateKVCacheTokenSize() (int, string) {
 	config := g.ModelConfig
 
-	hiddenSize := getInt(config, []string{"hidden_size", "n_embd", "d_model"}, 0)
-	hiddenLayers := getInt(config, []string{"num_hidden_layers", "n_layer", "n_layers"}, 0)
-	attentionHeads := getInt(config, []string{"num_attention_heads", "n_head", "n_heads"}, 0)
-	kvHeads := getInt(config, []string{"num_key_value_heads", "n_head_kv", "n_kv_heads"}, 0)
-	headDim := getInt(config, []string{"head_dim"}, 0)
+	hiddenSize := getInt(config, configKeyMap["hiddenSize"], 0)
+	hiddenLayers := getInt(config, configKeyMap["numHiddenLayers"], 0)
+	attentionHeads := getInt(config, configKeyMap["numAttentionHeads"], 0)
+	kvHeads := getInt(config, configKeyMap["numKeyValueHeads"], 0)
+	headDim := getInt(config, optionalKeyMap["headDim"], 0)
 
 	if headDim == 0 && attentionHeads > 0 {
 		headDim = hiddenSize / attentionHeads
 	}
 
 	// DeepSeek MLA
-	kvLoraRank := getInt(config, []string{"kv_lora_rank"}, -1)
-	qkRopeHeadDim := getInt(config, []string{"qk_rope_head_dim"}, 0)
+	kvLoraRank := getInt(config, optionalKeyMap["kvLoraRank"], -1)
+	qkRopeHeadDim := getInt(config, optionalKeyMap["qkRopeHeadDim"], 0)
 
 	// Fallback KV heads
 	if kvHeads == 0 && attentionHeads > 0 {
@@ -465,9 +519,83 @@ func (g *Generator) FinalizeParams() {
 	g.Param.AttnType = attnType
 }
 
+// loadFromCatalog checks whether the model repo exists in the embedded catalog.
+// If found, it populates the generator's ModelConfig and Param fields from the
+// catalog entry, avoiding any HuggingFace API calls.
+func (g *Generator) loadFromCatalog() bool {
+	if len(g.CatalogData) == 0 {
+		return false
+	}
+
+	catalog := ModelCatalog{}
+	if err := yaml.Unmarshal(g.CatalogData, &catalog); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to unmarshal model catalog for %q: %v\n", g.ModelRepo, err)
+		return false
+	}
+
+	var entry *CatalogEntry
+	for i, m := range catalog.Models {
+		if strings.EqualFold(m.Name, g.ModelRepo) {
+			entry = &catalog.Models[i]
+			break
+		}
+	}
+	if entry == nil {
+		return false
+	}
+
+	// Populate ModelConfig from catalog entry so existing calculation
+	// functions (ParseModelMetadata, FinalizeParams) work unchanged.
+	g.ModelConfig = map[string]interface{}{
+		"hidden_size":             entry.HiddenSize,
+		"num_hidden_layers":       entry.NumHiddenLayers,
+		"num_attention_heads":     entry.NumAttentionHeads,
+		"num_key_value_heads":     entry.NumKeyValueHeads,
+		"max_position_embeddings": entry.ModelTokenLimit,
+	}
+	if entry.HeadDim > 0 {
+		g.ModelConfig["head_dim"] = entry.HeadDim
+	}
+	if entry.KVLoraRank > 0 {
+		g.ModelConfig["kv_lora_rank"] = entry.KVLoraRank
+	}
+	if entry.QKRopeHeadDim > 0 {
+		g.ModelConfig["qk_rope_head_dim"] = entry.QKRopeHeadDim
+	}
+
+	// Set architectures in config for ParseModelMetadata to pick up
+	archInterfaces := make([]interface{}, len(entry.Architectures))
+	for i, a := range entry.Architectures {
+		archInterfaces[i] = a
+	}
+	g.ModelConfig["architectures"] = archInterfaces
+
+	// Populate fields that FetchModelMetadata would have set
+	g.Param.Metadata.ModelFileSize = entry.ModelFileSize
+	g.Param.VLLM.ModelRunParams = make(map[string]string)
+
+	if entry.LoadFormat != "" {
+		g.LoadFormat = entry.LoadFormat
+	}
+	if entry.ConfigFormat != "" {
+		g.ConfigFormat = entry.ConfigFormat
+	} else if entry.LoadFormat != "" {
+		g.ConfigFormat = entry.LoadFormat
+	}
+	if entry.TokenizerMode != "" {
+		g.TokenizerMode = entry.TokenizerMode
+	} else if entry.LoadFormat != "" {
+		g.TokenizerMode = entry.LoadFormat
+	}
+
+	return true
+}
+
 func (g *Generator) Generate() (*model.PresetParam, error) {
-	if err := g.FetchModelMetadata(); err != nil {
-		return nil, err
+	if !g.loadFromCatalog() {
+		if err := g.FetchModelMetadata(); err != nil {
+			return nil, err
+		}
 	}
 	g.ParseModelMetadata()
 	g.FinalizeParams()
@@ -475,11 +603,16 @@ func (g *Generator) Generate() (*model.PresetParam, error) {
 	return &g.Param, nil
 }
 
-// GeneratePreset is the global function to generate preset param
-func GeneratePreset(modelRepo, token string) (*model.PresetParam, error) {
+// GeneratePreset is the global function to generate preset param.
+// If catalogData is provided, the generator will check for the model in the
+// catalog before making any HuggingFace API calls.
+func GeneratePreset(modelRepo, token string, catalogData ...[]byte) (*model.PresetParam, error) {
 	if modelRepo == "" {
 		return nil, errors.New("model repo is required")
 	}
 	gen := NewGenerator(modelRepo, token)
+	if len(catalogData) > 0 {
+		gen.CatalogData = catalogData[0]
+	}
 	return gen.Generate()
 }

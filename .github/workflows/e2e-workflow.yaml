@@ -23,7 +23,7 @@ on:
         default: "swedencentral"
       k8s_version:
         type: string
-        default: "1.32.9"
+        default: "1.33.8"
       pull_request_number:
         type: string
       ginkgo_label:
@@ -42,7 +42,7 @@ jobs:
 
     env:
       TEST_SUITE: ${{ inputs.node_provisioner }}
-      GO_VERSION: "1.25"
+      GO_VERSION: "1.26.2"
       KARPENTER_NAMESPACE: "karpenter"
       GPU_PROVISIONER_NAMESPACE: "gpu-provisioner"
 
@@ -137,6 +137,7 @@ jobs:
         run: |
           AI_MODELS_REGISTRY=$E2E_ACR_AMRT_USERNAME.azurecr.io \
           AI_MODELS_REGISTRY_SECRET=$E2E_AMRT_SECRET_NAME \
+          GINKGO_LABEL=${{ inputs.ginkgo_label }} \
           HF_TOKEN=$HF_TOKEN \
           make kaito-workspace-e2e-test
         env:
@@ -149,7 +150,7 @@ jobs:
         run: |
           AI_MODELS_REGISTRY=$E2E_ACR_AMRT_USERNAME.azurecr.io \
           AI_MODELS_REGISTRY_SECRET=$E2E_AMRT_SECRET_NAME \
-          GINKGO_LABEL=FastCheck \
+          GINKGO_LABEL=${{ inputs.ginkgo_label || 'FastCheck' }} \
           HF_TOKEN=$HF_TOKEN \
           make kaito-workspace-e2e-test
         env:

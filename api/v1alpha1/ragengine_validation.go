@@ -47,17 +47,30 @@ func (w *RAGEngine) Validate(ctx context.Context) (errs *apis.FieldError) {
 		old := base.(*RAGEngine)
 		errs = errs.Also(
 			w.validateCreate().ViaField("spec"),
-			w.Spec.Compute.validateUpdate(old.Spec.Compute).ViaField("resource"),
+			w.validateUpdate(old).ViaField("resource"),
 		)
 	}
 	return errs
 }
 
-func (w *RAGEngine) validateCreate() (errs *apis.FieldError) {
-	if w.Spec.InferenceService == nil {
-		errs = errs.Also(apis.ErrGeneric("InferenceService must be specified", ""))
+func (w *RAGEngine) validateUpdate(old *RAGEngine) (errs *apis.FieldError) {
+	if w.Spec.Compute != nil && old.Spec.Compute == nil {
+		errs = errs.Also(apis.ErrGeneric("Compute resources cannot be added after creation", "compute"))
 	}
-	errs = errs.Also(w.Spec.InferenceService.validateCreate())
+	if w.Spec.Compute == nil && old.Spec.Compute != nil {
+		errs = errs.Also(apis.ErrGeneric("Compute resources cannot be removed after creation", "compute"))
+	}
+	if w.Spec.Compute != nil && old.Spec.Compute != nil {
+		errs = errs.Also(w.Spec.Compute.validateUpdate(old.Spec.Compute).ViaField("resource"))
+	}
+	return errs
+}
+
+func (w *RAGEngine) validateCreate() (errs *apis.FieldError) {
+	if w.Spec.InferenceService != nil {
+		errs = errs.Also(w.Spec.InferenceService.validateCreate())
+	}
+
 	if w.Spec.Embedding == nil {
 		errs = errs.Also(apis.ErrGeneric("Embedding must be specified", ""))
 		return errs
@@ -68,12 +81,16 @@ func (w *RAGEngine) validateCreate() (errs *apis.FieldError) {
 	if w.Spec.Embedding.Local != nil && w.Spec.Embedding.Remote != nil {
 		errs = errs.Also(apis.ErrGeneric("Either remote embedding or local embedding must be specified, but not both", ""))
 	}
-	errs = errs.Also(w.Spec.Compute.validateRAGCreate())
+
+	if w.Spec.Compute != nil {
+		errs = errs.Also(w.Spec.Compute.validateRAGCreate())
+	}
+
 	if w.Spec.Embedding.Local != nil {
-		w.Spec.Embedding.Local.validateCreate().ViaField("embedding")
+		errs = errs.Also(w.Spec.Embedding.Local.validateCreate().ViaField("embedding"))
 	}
 	if w.Spec.Embedding.Remote != nil {
-		w.Spec.Embedding.Remote.validateCreate().ViaField("embedding")
+		errs = errs.Also(w.Spec.Embedding.Remote.validateCreate().ViaField("embedding"))
 	}
 
 	return errs

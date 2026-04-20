@@ -18,7 +18,6 @@ import (
 
 	"github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils/plugin"
-	"github.com/kaito-project/kaito/pkg/workspace/inference"
 	metadata "github.com/kaito-project/kaito/presets/workspace/models"
 )
 
@@ -48,45 +47,6 @@ const (
 	PresetDeepSeekV3Model               = "deepseek-v3-0324"
 )
 
-var (
-	baseCommandPresetDeepseekInference = "accelerate launch"
-	deepseekLlama8bRunParams           = map[string]string{
-		"torch_dtype": "bfloat16",
-		"pipeline":    "text-generation",
-	}
-	deepseekLlama8bRunParamsVLLM = map[string]string{
-		"reasoning-parser": "deepseek_r1",
-	}
-	deepseekQwen14bRunParams = map[string]string{
-		"torch_dtype": "bfloat16",
-		"pipeline":    "text-generation",
-	}
-	deepseekQwen14bRunParamsVLLM = map[string]string{
-		"reasoning-parser": "deepseek_r1",
-	}
-	deepseekR1RunParams = map[string]string{
-		"torch_dtype":        "bfloat16",
-		"pipeline":           "text-generation",
-		"allow_remote_files": "",
-	}
-	deepseekR1RunParamsVLLM = map[string]string{
-		"reasoning-parser":        "deepseek_r1",
-		"chat-template":           "/workspace/chat_templates/tool-chat-deepseekr1.jinja",
-		"tool-call-parser":        "deepseek_v3",
-		"enable-auto-tool-choice": "",
-	}
-	deepseekV3RunParams = map[string]string{
-		"torch_dtype":        "bfloat16",
-		"pipeline":           "text-generation",
-		"allow_remote_files": "",
-	}
-	deepseekV3RunParamsVLLM = map[string]string{
-		"chat-template":           "/workspace/chat_templates/tool-chat-deepseekv3.jinja",
-		"tool-call-parser":        "deepseek_v3",
-		"enable-auto-tool-choice": "",
-	}
-)
-
 var deepseekA llama8b
 
 type llama8b struct{}
@@ -100,18 +60,8 @@ func (*llama8b) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           131072,
 		ModelTokenLimit:         131072, // max_position_embeddings from HF config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetDeepseekInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    deepseekLlama8bRunParams,
-				ModelName:         PresetDeepSeekR1DistillLlama8BModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetDeepSeekR1DistillLlama8BModel,
-				ModelRunParams: deepseekLlama8bRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetDeepSeekR1DistillLlama8BModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetDeepSeekR1DistillLlama8BModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -139,18 +89,8 @@ func (*qwen14b) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           196608,
 		ModelTokenLimit:         131072, // max_position_embeddings from HF config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetDeepseekInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    deepseekQwen14bRunParams,
-				ModelName:         PresetDeepSeekR1DistillQwen14BModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetDeepSeekR1DistillQwen14BModel,
-				ModelRunParams: deepseekQwen14bRunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetDeepSeekR1DistillQwen14BModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetDeepSeekR1DistillQwen14BModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -180,20 +120,8 @@ func (*deepseekR1) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:   70272,
 		ModelTokenLimit: 163840, // max_position_embeddings from DeepSeek-R1-0528 config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetDeepseekInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    deepseekR1RunParams,
-				ModelName:         PresetDeepSeekR1Model,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:          metadata.DefaultVLLMCommand,
-				ModelName:            PresetDeepSeekR1Model,
-				ModelRunParams:       deepseekR1RunParamsVLLM,
-				RayLeaderBaseCommand: metadata.DefaultVLLMRayLeaderBaseCommand,
-				RayWorkerBaseCommand: metadata.DefaultVLLMRayWorkerBaseCommand,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetDeepSeekR1Model],
+			VLLM:         metadata.VLLMInferenceParameters[PresetDeepSeekR1Model],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -223,20 +151,8 @@ func (*deepseekV3) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:   70272,
 		ModelTokenLimit: 163840, // max_position_embeddings from DeepSeek-V3-0324 config
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetDeepseekInference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    deepseekV3RunParams,
-				ModelName:         PresetDeepSeekR1Model,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:          metadata.DefaultVLLMCommand,
-				ModelName:            PresetDeepSeekR1Model,
-				ModelRunParams:       deepseekV3RunParamsVLLM,
-				RayLeaderBaseCommand: metadata.DefaultVLLMRayLeaderBaseCommand,
-				RayWorkerBaseCommand: metadata.DefaultVLLMRayWorkerBaseCommand,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetDeepSeekV3Model],
+			VLLM:         metadata.VLLMInferenceParameters[PresetDeepSeekV3Model],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}

@@ -18,23 +18,12 @@ import (
 
 	"github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils/plugin"
-	"github.com/kaito-project/kaito/pkg/workspace/inference"
 	metadata "github.com/kaito-project/kaito/presets/workspace/models"
 )
 
 const (
 	PresetGemma3_4BInstructModel  = "gemma-3-4b-instruct"
 	PresetGemma3_27BInstructModel = "gemma-3-27b-instruct"
-)
-
-var (
-	baseCommandPresetGemma3Inference = "accelerate launch"
-	gemma3RunParams                  = map[string]string{
-		"torch_dtype":        "auto",
-		"pipeline":           "text-generation",
-		"allow_remote_files": "",
-	}
-	gemma3RunParamsVLLM = map[string]string{}
 )
 
 var gemma3_4bInst gemma3_4BInstruct
@@ -62,18 +51,8 @@ func (*gemma3_4BInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           348160,
 		ModelTokenLimit:         131072,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetGemma3Inference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    gemma3RunParams,
-				ModelName:         PresetGemma3_4BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetGemma3_4BInstructModel,
-				ModelRunParams: gemma3RunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetGemma3_4BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetGemma3_4BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(30) * time.Minute,
 	}
@@ -102,18 +81,8 @@ func (*gemma3_27BInstruct) GetInferenceParameters() *model.PresetParam {
 		BytesPerToken:           666624,
 		ModelTokenLimit:         131072,
 		RuntimeParam: model.RuntimeParam{
-			Transformers: model.HuggingfaceTransformersParam{
-				BaseCommand:       baseCommandPresetGemma3Inference,
-				AccelerateParams:  inference.DefaultAccelerateParams,
-				InferenceMainFile: inference.DefaultTransformersMainFile,
-				ModelRunParams:    gemma3RunParams,
-				ModelName:         PresetGemma3_27BInstructModel,
-			},
-			VLLM: model.VLLMParam{
-				BaseCommand:    metadata.DefaultVLLMCommand,
-				ModelName:      PresetGemma3_27BInstructModel,
-				ModelRunParams: gemma3RunParamsVLLM,
-			},
+			Transformers: metadata.TransformerInferenceParameters[PresetGemma3_27BInstructModel],
+			VLLM:         metadata.VLLMInferenceParameters[PresetGemma3_27BInstructModel],
 		},
 		ReadinessTimeout: time.Duration(45) * time.Minute,
 	}
