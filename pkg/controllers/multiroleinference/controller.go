@@ -508,19 +508,12 @@ const (
 // defaultPDPluginsConfigTemplate is the default EPP plugins YAML template for P/D disaggregated serving.
 // Uses the llm-d EndpointPickerConfig format with schedulingProfiles for prefill and decode.
 // The %%MODEL_NAME%% placeholder is replaced with the actual model name from the MRI spec.
-// The token-producer plugin calls the vLLM render sidecar (localhost:8100) for tokenization,
-// which enables the precise-prefix-cache-scorer to compute prefix cache hit ratios.
 const defaultPDPluginsConfigTemplate = `apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
 featureGates:
   - prepareDataPlugins
 plugins:
   - type: disagg-headers-handler
-  - type: token-producer
-    parameters:
-      modelName: %%MODEL_NAME%%
-      vllm:
-        http: "http://localhost:8100"
   - type: prefix-based-pd-decider
     parameters:
       nonCachedTokens: 4
@@ -535,6 +528,8 @@ plugins:
       indexerConfig:
         kvBlockIndexConfig:
           enableMetrics: true
+        tokenizersPoolConfig:
+          modelName: %%MODEL_NAME%%
   - type: by-label-selector
     name: prefill-filter
     parameters:
@@ -658,32 +653,6 @@ func (r *MultiRoleInferenceReconciler) reconcileInferencePool(
 	// behind the mesh, matching standalone InferenceSet behavior.
 	eppValues["flags"] = map[string]string{
 		"secure-serving": "false",
-	}
-	// Tokenizer sidecar: GPU-less vLLM render process for token-producer plugin.
-	// Runs alongside EPP to serve tokenization requests via HTTP on port 8100.
-	eppValues["sidecar"] = map[string]any{
-		"enabled":         true,
-		"name":            "tokenizer",
-		"image":           consts.TokenizerSidecarImage,
-		"imagePullPolicy": string(corev1.PullIfNotPresent),
-		"command":         "vllm",
-		"args":            []string{"launch", "render", mri.Spec.Model.Name, fmt.Sprintf("--port=%d", consts.TokenizerSidecarPort)},
-		"ports": []map[string]any{
-			{
-				"containerPort": consts.TokenizerSidecarPort,
-				"name":          "tokenizer",
-				"protocol":      "TCP",
-			},
-		},
-		"resources": map[string]any{
-			"requests": map[string]string{
-				"cpu":    "500m",
-				"memory": "1Gi",
-			},
-			"limits": map[string]string{
-				"memory": "2Gi",
-			},
-		},
 	}
 
 	helmValues := map[string]any{
