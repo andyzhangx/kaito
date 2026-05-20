@@ -647,30 +647,15 @@ func validateMultiRoleInferenceChatCompletions(mriObj *kaitov1alpha1.MultiRoleIn
 	modelName := getModelName(mriObj.Spec.Model.Name)
 
 	By("Validating /v1/chat/completions via decode pod", func() {
+		coreClient, err := utils.GetK8sClientset()
+		Expect(err).NotTo(HaveOccurred(), "Failed to create core client")
+
+		k8sConfig, err := utils.GetK8sConfig()
+		Expect(err).NotTo(HaveOccurred(), "Failed to get k8s config")
+
 		Eventually(func() bool {
-			coreClient, err := utils.GetK8sClientset()
-			if err != nil {
-				GinkgoWriter.Printf("Failed to create core client: %v\n", err)
-				return false
-			}
-
-			// Find a decode InferenceSet's pod
-			isList := &kaitov1alpha1.InferenceSetList{}
-			err = utils.TestingCluster.KubeClient.List(ctx, isList,
-				client.InNamespace(mriObj.Namespace),
-				client.MatchingLabels{
-					kaitov1alpha1.LabelMultiRoleInferenceParent: mriObj.Name,
-					kaitov1alpha1.LabelInferenceRole:            string(kaitov1alpha1.MultiRoleInferenceRoleDecode),
-				})
-			if err != nil || len(isList.Items) == 0 {
-				GinkgoWriter.Printf("Failed to find decode InferenceSet: %v\n", err)
-				return false
-			}
-			_ = &isList.Items[0] // decode InferenceSet found
-
-			// The InferenceSet controller creates Workspaces with GenerateName: <inferenceset>-,
-			// so we need to find the actual Workspace to get the correct pod name.
-			wsList := &kaitov1alpha1.WorkspaceList{}
+			// Find the decode Workspace to get the service name and pod name
+			wsList := &kaitov1beta1.WorkspaceList{}
 			err = utils.TestingCluster.KubeClient.List(ctx, wsList,
 				client.InNamespace(namespaceName),
 				client.MatchingLabels{
@@ -691,22 +676,13 @@ func validateMultiRoleInferenceChatCompletions(mriObj *kaitov1alpha1.MultiRoleIn
 			expectedCompletion := `"object":"chat.completion`
 			execOption := corev1.PodExecOptions{
 				Command: []string{"bash", "-c", fmt.Sprintf(
-					`apt-get update -qq && apt-get install -qq -y curl >/dev/null 2>&1; `+
-						`RESP=$(curl -s --max-time 30 -X POST -H "Content-Type: application/json" `+
+					`curl -s --max-time 30 -X POST -H "Content-Type: application/json" `+
 						`-d '{"model":"%s","messages":[{"role":"user","content":"What is Kubernetes?"}],"max_tokens":7,"temperature":0}' `+
-						`%s); `+
-						`echo "MRI chat response: $RESP"; `+
-						`echo "$RESP" | grep -e '%s'`,
+						`%s | tee /dev/stderr | grep -q '%s'`,
 					modelName, svcEndpoint, expectedCompletion)},
 				Container: decodeWS.Name,
 				Stdout:    true,
 				Stderr:    true,
-			}
-
-			k8sConfig, err := utils.GetK8sConfig()
-			if err != nil {
-				GinkgoWriter.Printf("Failed to get k8s config: %v\n", err)
-				return false
 			}
 
 			execCtx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
