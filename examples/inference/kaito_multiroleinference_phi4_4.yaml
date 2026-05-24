@@ -2,11 +2,12 @@
 apiVersion: kaito.sh/v1alpha1
 kind: MultiRoleInference
 metadata:
-  name: phi-4
+  name: phi-4-mini
+  namespace: default
 spec:
   labelSelector:
     matchLabels:
-      apps: phi-4
+      apps: phi-4-mini
   model:
     name: phi-4-mini-instruct
   roles:
