@@ -508,8 +508,6 @@ const (
 // Uses the llm-d EndpointPickerConfig format with schedulingProfiles for prefill and decode.
 const defaultPDPluginsConfigTemplate = `apiVersion: inference.networking.x-k8s.io/v1alpha1
 kind: EndpointPickerConfig
-featureGates:
-  - prepareDataPlugins
 plugins:
   - type: disagg-headers-handler
   - type: prefix-based-pd-decider
