@@ -284,6 +284,9 @@ func (c *InferenceSetReconciler) addOrUpdateInferenceSet(ctx context.Context, iO
 			if role, ok := iObj.Labels[kaitov1alpha1.LabelInferenceRole]; ok {
 				workspaceLabels[kaitov1alpha1.LabelInferenceRole] = role
 			}
+			if mriParent, ok := iObj.Labels[kaitov1alpha1.LabelMultiRoleInferenceParent]; ok {
+				workspaceLabels[kaitov1alpha1.LabelMultiRoleInferenceParent] = mriParent
+			}
 			workspaceLabels[consts.WorkspaceCreatedByInferenceSetLabel] = iObj.Name
 			workspaceObj.Labels = workspaceLabels
 
@@ -325,6 +328,9 @@ func (c *InferenceSetReconciler) addOrUpdateInferenceSet(ctx context.Context, iO
 	// Propagate inference-role from InferenceSet metadata (reliable even if template labels are pruned).
 	if role, ok := iObj.Labels[kaitov1alpha1.LabelInferenceRole]; ok {
 		desiredLabels[kaitov1alpha1.LabelInferenceRole] = role
+	}
+	if mriParent, ok := iObj.Labels[kaitov1alpha1.LabelMultiRoleInferenceParent]; ok {
+		desiredLabels[kaitov1alpha1.LabelMultiRoleInferenceParent] = mriParent
 	}
 	if len(desiredLabels) > 0 {
 		for i := range wsList.Items {
