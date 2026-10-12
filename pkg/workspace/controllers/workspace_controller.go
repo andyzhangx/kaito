@@ -1634,7 +1634,8 @@ func (c *WorkspaceReconciler) UpdateWorkspaceTargetNodeCount(ctx context.Context
 
 		if err := workspace.UpdateWorkspaceStatus(ctx, c.Client, &client.ObjectKey{Name: wObj.Name, Namespace: wObj.Namespace}, func(status *kaitov1beta1.WorkspaceStatus) error {
 			if wObj.Inference != nil {
-				if v1beta1.GetWorkspaceRuntimeName(wObj) == pkgmodel.RuntimeNameVLLM {
+				useDirectCount := wObj.Inference.Template != nil || v1beta1.GetWorkspaceRuntimeName(wObj) != pkgmodel.RuntimeNameVLLM
+				if !useDirectCount {
 					targetNodeCount, err = c.Estimator.EstimateNodeCount(ctx, req, c.Client)
 					if err != nil {
 						return fmt.Errorf("failed to calculate target node count: %w", err)
@@ -1643,10 +1644,12 @@ func (c *WorkspaceReconciler) UpdateWorkspaceTargetNodeCount(ctx context.Context
 						targetNodeCount = 1
 					}
 				} else {
-					// For non-vLLM runtime, use the Resource.Count directly
+					// Template-based inference and non-vLLM runtimes do not have the
+					// preset metadata needed by the GPU estimator. Use Resource.Count
+					// directly for the minimal POC-style custom model path.
 					//nolint:staticcheck //SA1019: deprecate Resource.Count field
 					targetNodeCount = int32(*wObj.Resource.Count)
-					klog.Infof("[EstimateNodeCount] workspace=%s using Resource.Count=%d for non-vLLM runtime", wObj.Name, targetNodeCount)
+					klog.Infof("[EstimateNodeCount] workspace=%s using Resource.Count=%d for template/non-vLLM inference", wObj.Name, targetNodeCount)
 				}
 			}
 			status.TargetNodeCount = int32(targetNodeCount)

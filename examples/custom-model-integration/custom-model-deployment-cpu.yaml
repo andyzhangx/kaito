@@ -1,0 +1,72 @@
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: workspace-custom-llm-cpu
+  annotations:
+    kaito.sh/runtime: transformers
+resource:
+  # CPU POC: requires KAITO running in BYO mode (disableNodeAutoProvisioning=true)
+  # and at least one existing CPU node carrying this label.
+  count: 1
+  labelSelector:
+    matchLabels:
+      kaito.sh/cpu-inference: "true"
+inference:
+  template:
+    metadata:
+      labels:
+        apps: custom-llm-cpu
+    spec:
+      containers:
+        - name: custom-llm-cpu
+          image: mcr.microsoft.com/aks/kaito/kaito-base-cpu:0.0.1
+          ports:
+            - containerPort: 5000
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 5000
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 5000
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          command:
+            - "python3"
+          args:
+            - "/workspace/tfs/inference_api.py"
+            - "--pipeline"
+            - "text-generation"
+            - "--allow_remote_files"
+            - "--pretrained_model_name_or_path"
+            - "microsoft/Phi-3-mini-4k-instruct"
+            - "--torch_dtype"
+            - "float32"
+            - "--device_map"
+            - "cpu"
+        # env:
+        #   HF_TOKEN is required only for private or gated Hugging Face models
+        #   Uncomment and configure this block if needed
+        #   - name: HF_TOKEN
+        #     valueFrom:
+        #       secretKeyRef:
+        #         name: hf-token-secret
+        #         key: HF_TOKEN

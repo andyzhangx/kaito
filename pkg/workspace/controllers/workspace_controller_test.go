@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubefake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
@@ -884,7 +885,7 @@ func TestUpdateWorkspaceTargetNodeCount(t *testing.T) {
 			expectedError:  false,
 			expectedTarget: 1,
 		},
-		"should use estimator when inference present and set returned value": {
+		"should use estimator when inference preset present and set returned value": {
 			workspace: &v1beta1.Workspace{
 				ObjectMeta: v1.ObjectMeta{Name: "test-workspace", Namespace: "default"},
 				Inference:  &v1beta1.InferenceSpec{Preset: &v1beta1.PresetSpec{PresetMeta: v1beta1.PresetMeta{Name: "test-model"}}},
@@ -906,6 +907,29 @@ func TestUpdateWorkspaceTargetNodeCount(t *testing.T) {
 			},
 			expectedError:  false,
 			expectedTarget: 3,
+		},
+		"should use resource count for template inference even when runtime defaults to vllm": {
+			workspace: &v1beta1.Workspace{
+				ObjectMeta: v1.ObjectMeta{Name: "test-workspace", Namespace: "default"},
+				Resource:   v1beta1.ResourceSpec{Count: ptr.To(2)},
+				Inference:  &v1beta1.InferenceSpec{Template: &corev1.PodTemplateSpec{}},
+				Status:     v1beta1.WorkspaceStatus{TargetNodeCount: 0},
+			},
+			setupMocks: func(c *test.MockClient, e *mockEstimator, updatedTarget *int32) {
+				c.On("Get", mock.Anything, mock.Anything, mock.IsType(&v1beta1.Workspace{}), mock.Anything).
+					Run(func(args mock.Arguments) {
+						ws := args.Get(2).(*v1beta1.Workspace)
+						ws.ObjectMeta = v1.ObjectMeta{Name: "test-workspace", Namespace: "default"}
+						ws.Status = v1beta1.WorkspaceStatus{TargetNodeCount: 0}
+					}).Return(nil).Once()
+				c.StatusMock.On("Update", mock.Anything, mock.IsType(&v1beta1.Workspace{}), mock.Anything).
+					Run(func(args mock.Arguments) {
+						ws := args.Get(1).(*v1beta1.Workspace)
+						*updatedTarget = ws.Status.TargetNodeCount
+					}).Return(nil)
+			},
+			expectedError:  false,
+			expectedTarget: 2,
 		},
 		"should return error when estimator fails": {
 			workspace: &v1beta1.Workspace{
