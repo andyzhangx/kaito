@@ -8,6 +8,7 @@ resource:
   # CPU POC: requires KAITO running in BYO mode (disableNodeAutoProvisioning=true)
   # and at least one existing CPU node carrying this label.
   count: 1
+  instanceType: Standard_D16s_v5
   labelSelector:
     matchLabels:
       kaito.sh/cpu-inference: "true"
@@ -19,7 +20,7 @@ inference:
     spec:
       containers:
         - name: custom-llm-cpu
-          image: mcr.microsoft.com/aks/kaito/kaito-base-cpu:0.0.1
+          image: andyzhangx/kaito-base-cpu:v0.0.1
           ports:
             - containerPort: 5000
           livenessProbe:
