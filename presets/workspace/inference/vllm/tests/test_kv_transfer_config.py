@@ -113,6 +113,16 @@ class TestSetKvTransferConfig:
             "kv_load_failure_policy": "fail",
         }
 
+    def test_cpu_env_skips_lmcache_default(self):
+        """CPU runtime must also be detected when vLLM target device is set via env."""
+        args = _make_args(
+            device=None,
+            kaito_kv_cache_cpu_memory_utilization=0.5,
+        )
+        with patch.dict(os.environ, {"VLLM_TARGET_DEVICE": "cpu"}, clear=True):
+            set_kv_transfer_config_if_applicable(args)
+        assert args.kv_transfer_config is None
+
     def test_user_provided_config_not_overridden(self):
         """When user provides kv_transfer_config, it should not be overridden."""
         user_config = {"kv_connector": "CustomConnector", "kv_role": "kv_both"}

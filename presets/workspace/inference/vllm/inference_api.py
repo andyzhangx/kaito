@@ -502,8 +502,15 @@ def get_max_gpu_memory_utilization(device_index: int = 0) -> float:
 
 
 def _device_is_cpu(args: argparse.Namespace) -> bool:
-    """Return True when vLLM is explicitly configured to run on CPU."""
-    return str(getattr(args, "device", "") or "").strip().lower() == "cpu"
+    """Return True when vLLM is explicitly configured to run on CPU.
+
+    KAITO's CPU workspace path can set the target device either through a
+    vLLM CLI arg (``--device cpu``) or through the ``VLLM_TARGET_DEVICE``
+    environment variable baked into the container/pod spec.
+    """
+    cli_device = str(getattr(args, "device", "") or "").strip().lower()
+    env_device = str(os.environ.get("VLLM_TARGET_DEVICE", "") or "").strip().lower()
+    return cli_device == "cpu" or env_device == "cpu"
 
 
 def set_kv_transfer_config_if_applicable(args: argparse.Namespace) -> None:
