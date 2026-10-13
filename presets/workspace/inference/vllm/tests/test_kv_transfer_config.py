@@ -29,6 +29,7 @@ from inference_api import set_kv_transfer_config_if_applicable  # noqa: E402, I0
 def _make_args(**kwargs):
     """Create a minimal argparse.Namespace for testing."""
     defaults = {
+        "device": "cuda",
         "kv_transfer_config": None,
         "kaito_kv_cache_cpu_memory_utilization": None,
         "tensor_parallel_size": 1,
@@ -87,6 +88,30 @@ class TestSetKvTransferConfig:
         with patch.dict(os.environ, {"KAITO_INFERENCE_ROLE": "decode"}, clear=True):
             set_kv_transfer_config_if_applicable(args)
         assert args.kv_transfer_config["kv_connector"] == "NixlConnector"
+
+    def test_cpu_device_skips_lmcache_default(self):
+        """CPU runtime must not inject LMCache, which is absent from the CPU image."""
+        args = _make_args(
+            device="cpu",
+            kaito_kv_cache_cpu_memory_utilization=0.5,
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            set_kv_transfer_config_if_applicable(args)
+        assert args.kv_transfer_config is None
+
+    def test_cpu_device_preserves_existing_nixl_config(self):
+        """CPU runtime should not remove the disaggregation connector if it is already set."""
+        args = _make_args(
+            device="cpu",
+            kaito_kv_cache_cpu_memory_utilization=0.5,
+        )
+        with patch.dict(os.environ, {"KAITO_INFERENCE_ROLE": "decode"}, clear=True):
+            set_kv_transfer_config_if_applicable(args)
+        assert args.kv_transfer_config == {
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_both",
+            "kv_load_failure_policy": "fail",
+        }
 
     def test_user_provided_config_not_overridden(self):
         """When user provides kv_transfer_config, it should not be overridden."""
