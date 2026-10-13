@@ -1,0 +1,76 @@
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: workspace-custom-vllm-cpu
+  annotations:
+    kaito.sh/runtime: vllm
+resource:
+  # CPU vLLM POC: requires KAITO running in BYO mode (disableNodeAutoProvisioning=true)
+  # and at least one existing CPU node carrying this label.
+  count: 1
+  instanceType: Standard_D16s_v5
+  labelSelector:
+    matchLabels:
+      kaito.sh/cpu-inference: "true"
+inference:
+  template:
+    metadata:
+      labels:
+        apps: custom-vllm-cpu
+    spec:
+      containers:
+        - name: custom-vllm-cpu
+          image: andyzhangx/kaito-vllm-cpu:v0.0.1
+          ports:
+            - containerPort: 5000
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 5000
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /health
+              port: 5000
+              scheme: HTTP
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          env:
+            - name: VLLM_TARGET_DEVICE
+              value: "cpu"
+            - name: VLLM_CPU_KVCACHE_SPACE
+              value: "8"
+          command:
+            - "python3"
+          args:
+            - "/workspace/vllm/inference_api.py"
+            - "--model"
+            - "Qwen/Qwen2.5-0.5B-Instruct"
+            - "--served-model-name"
+            - "qwen2.5-0.5b-instruct-cpu"
+            - "--dtype"
+            - "bfloat16"
+            - "--max-model-len"
+            - "4096"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
