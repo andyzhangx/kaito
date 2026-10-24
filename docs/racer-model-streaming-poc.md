@@ -209,6 +209,51 @@ Racer origin 必须指向这个完整容器；sidecar 中 `/blob-key` 对应容�
 
 ## 5. 使用 Makefile 构建控制器、streaming base 和 Racer runtime
 
+### `KAITO_STREAMING_BASE_IMAGE` 是做什么的？
+
+`KAITO_STREAMING_BASE_IMAGE` 是**构建 Racer 推理镜像时使用的基础镜像地址**。它提供已有的 KAITO preset 推理环境，包括 **vLLM、Ray 和 Model Streamer**；Racer runtime 构建再在其上加入 `libkaito_racer_cache.so`，让 Streamer 的模型数据读取接入 Racer。
+
+同一个变量在两个 Make 目标中承担不同角色：
+
+| Make 目标 | `KAITO_STREAMING_BASE_IMAGE` 的作用 |
+|---|---|
+| `docker-build-kaito-streaming-base` | **输出镜像名**：将现有 KAITO vLLM preset Dockerfile 构建为这个 tag |
+| `docker-build-racer-streaming` | **输入基础镜像**：通过 Dockerfile 的 `FROM ${KAITO_STREAMING_BASE_IMAGE}` 继承推理环境，再加入并检查 provider |
+
+```text
+现有 KAITO vLLM preset Dockerfile
+        │
+        ▼
+KAITO_STREAMING_BASE_IMAGE
+  vLLM + Ray + Model Streamer
+        │
+        │ 加入 libkaito_racer_cache.so
+        │ 检查 Streamer ABI 和 provider 加载
+        ▼
+RACER_STREAMING_IMAGE
+  最终部署到推理容器的 runtime 镜像
+```
+
+**基础镜像不是一个需要额外部署的容器，也不是 Racer cache server 或 `racer-object` sidecar 的镜像。** 各镜像的用途分别是：
+
+- `CONTROLLER_IMAGE`：运行 KAITO Workspace 控制器。
+- `KAITO_STREAMING_BASE_IMAGE`：构建阶段使用的推理底座，其内容由最终 runtime 镜像继承。
+- `RACER_STREAMING_IMAGE`（部署示例中赋给 `RACER_RUNTIME_IMAGE`）：运行 vLLM 推理进程，包含 Racer provider。
+- 管理员绑定中的 `objectImage`：单独运行 `racer-object` sidecar；它不是由上述 base/runtime 目标构建的。
+
+**已有兼容 base 时，不必重新构建它。** 将变量指向 registry 中现有的 tag 或 digest，只构建最终 Racer runtime 即可，例如：
+
+```bash
+# 先按下方完整构建示例设置 REGISTRY、VERSION、OUTPUT_TYPE、ARCH 和 PLATFORMS。
+# 将占位地址替换为真实、兼容且可拉取的基础镜像。
+export KAITO_STREAMING_BASE_IMAGE="YOUR_REGISTRY/compatible-kaito-streaming-base:YOUR_TAG"
+make docker-build-racer-streaming ARCH=amd64
+```
+
+这只跳过 base 的构建和推送；控制器仍需使用本 POC 的代码构建/部署。不能任意换成普通 vLLM 镜像或任意版本的 `kaito-base`：当前 POC 需要 KAITO preset 运行环境，以及 `runai-model-streamer==0.16.0`、`runai-model-streamer-azure==0.16.0` 和对应 cache ABI。最终 runtime 构建会检查兼容性，失败时应修正 base，而不是跳过检查。
+
+### 完整构建与推送示例
+
 ```bash
 git clone --branch poc/racer-model-streaming \
   https://github.com/andyzhangx/kaito.git
