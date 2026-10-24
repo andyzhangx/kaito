@@ -1,0 +1,16 @@
+# Merge into your EXISTING workspace chart values. This file is not kubectl YAML.
+# Replace every placeholder; install and validate Racer separately first.
+featureGates:
+  ModelMirror: true
+  ModelStreaming: true
+# Keep existing defaultModelMirrorStorageClass/defaultStreamingServiceAccount
+# and Workload Identity settings, or set them according to the streaming guide.
+racerCacheBindings:
+  - namespace: kaito-poc
+    account: YOUR_ACTUAL_STORAGE_ACCOUNT
+    container: YOUR_ACTUAL_MIRROR_CONTAINER
+    cacheName: kaito-model-cache
+    objectImage: YOUR_ACTUAL_RACER_OBJECT_IMAGE@sha256:YOUR_DIGEST
+    runtimeImage: YOUR_REGISTRY/kaito/vllm-racer@sha256:YOUR_DIGEST
+    # Administrative contract: never overwrite blobs at an existing key.
+    immutable: true

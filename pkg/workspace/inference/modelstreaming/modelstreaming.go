@@ -235,6 +235,6 @@ func SetStreamingConfig(streamingCfg *StreamingConfig, modelID, defaultSA string
 			return err
 		}
 		spec.ServiceAccountName = saName
-		return nil
+		return applyRacer(ctx, spec, streamingCfg, mainIdx)
 	}
 }

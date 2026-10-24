@@ -115,6 +115,7 @@ func main() {
 	var printVersionAndExit bool
 	var defaultModelMirrorStorageClass string
 	var defaultStreamingServiceAccount string
+	var racerCacheBindings string
 	var modelMirrorDownloadCPU string
 	var modelMirrorDownloadMemory string
 	var modelMirrorDownloadCPULimit string
@@ -139,6 +140,7 @@ func main() {
 	flag.BoolVar(&printVersionAndExit, "version", false, "Print version and exit.")
 	flag.StringVar(&defaultModelMirrorStorageClass, "default-model-mirror-storage-class", "", "StorageClass for ModelMirror PVCs.")
 	flag.StringVar(&defaultStreamingServiceAccount, "default-streaming-service-account", "", "Default ServiceAccount for streaming inference pods.")
+	flag.StringVar(&racerCacheBindings, "racer-cache-bindings", "", "POC: administrator JSON array of namespace/account/container Racer bindings. Empty disables Racer; Workspaces must opt in via kaito.sh/model-cache=racer.")
 	flag.StringVar(&modelMirrorDownloadCPU, "model-mirror-download-cpu", "", "CPU request for the ModelMirror download Job container. Empty uses the built-in default (2). Also sets the CPU limit unless --model-mirror-download-cpu-limit is provided.")
 	flag.StringVar(&modelMirrorDownloadMemory, "model-mirror-download-memory", "", "Memory request for the ModelMirror download Job container. Empty uses the built-in default (6Gi). Also sets the memory limit unless --model-mirror-download-memory-limit is provided.")
 	flag.StringVar(&modelMirrorDownloadCPULimit, "model-mirror-download-cpu-limit", "", "CPU limit for the ModelMirror download Job container. Empty uses the built-in default (4), or the configured CPU request when provided.")
@@ -154,6 +156,14 @@ func main() {
 		os.Exit(0)
 	}
 	klog.Info("version: ", version.VersionInfo())
+
+	parsedRacerBindings, racerErr := modelstreaming.ParseRacerBindings(racerCacheBindings)
+	if racerErr != nil {
+		klog.ErrorS(racerErr, "invalid Racer cache bindings")
+		exitWithErrorFunc()
+		return
+	}
+	modelstreaming.RacerBindings = parsedRacerBindings
 
 	downloadResources, err := mmconsts.ResolveDownloadJobResources(
 		modelMirrorDownloadCPU,

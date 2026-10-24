@@ -1,0 +1,35 @@
+# POC TEMPLATE ONLY: replace identity and validate the preset/GPU size.
+# Install and authorize Racer independently using the deployment guide.
+# Controller values: racer-model-streaming-values.yaml (do NOT kubectl apply it).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kaito-poc
+---
+# This inference identity is separate from Racer's Azure origin identity.
+# Configure its federated identity credential before creating the Workspace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-reader
+  namespace: kaito-poc
+  annotations:
+    azure.workload.identity/client-id: APP_MANAGED_IDENTITY_CLIENT_ID
+---
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: racer-model
+  namespace: kaito-poc
+  annotations:
+    kaito.sh/model-cache: racer
+    kaito.sh/streaming-service-account: model-reader
+resource:
+  instanceType: Standard_NC24ads_A100_v4
+  labelSelector:
+    matchLabels:
+      apps: racer-model
+inference:
+  preset:
+    name: microsoft/Phi-4-mini-instruct
+    runtime: vllm

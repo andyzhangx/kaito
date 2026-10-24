@@ -50,6 +50,9 @@ featureGates:
   enableEPPFlowControl: false
 defaultModelMirrorStorageClass: ""
 defaultStreamingServiceAccount: ""
+# POC opt-in: administrator-owned namespace/account/container Racer bindings.
+# See docs/racer-model-streaming-poc.md. Empty preserves existing behavior.
+racerCacheBindings: []
 # Resource overrides for the ModelMirror download Job. Empty uses the controller defaults:
 # requests 2 CPU / 6Gi, limits 4 CPU / 10Gi.
 modelMirrorDownloadCPU: ""
