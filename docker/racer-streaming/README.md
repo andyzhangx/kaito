@@ -10,10 +10,23 @@ provider to verify `cache_abi_version() == 1`, `blob_read`, and `shutdown`.
 These checks do **not** establish end-to-end GPU/cache correctness.
 
 ```bash
-docker build -f docker/racer-streaming/Dockerfile \
-  --build-arg KAITO_STREAMING_BASE_IMAGE="$KAITO_STREAMING_BASE_IMAGE" \
-  -t "$RACER_RUNTIME_IMAGE" .
+export REGISTRY=andyzhangx OUTPUT_TYPE=type=docker ARCH=amd64
+export PLATFORMS=linux/amd64 VERSION=0.13.0-racer
+export KAITO_STREAMING_BASE_IMAGE="$REGISTRY/kaito-streaming-base:$VERSION"
+export RACER_STREAMING_IMAGE="$REGISTRY/kaito-vllm-racer:$VERSION"
+make docker-build-kaito-streaming-base ARCH=amd64
+docker push "$KAITO_STREAMING_BASE_IMAGE"
+make docker-build-racer-streaming ARCH=amd64
 ```
+
+The base target builds the existing vLLM/Streamer preset Dockerfile. If you
+already have a compatible registry image, set `KAITO_STREAMING_BASE_IMAGE` to
+its version tag/digest and skip the base build/push. With `OUTPUT_TYPE=type=docker`,
+the image is loaded into the local daemon, **not** pushed; the docker-container
+builder cannot generally consume that daemon-local base. Publish it before the
+Racer build. `OUTPUT_TYPE=type=registry` instead explicitly exports to the registry.
+The final output defaults to `$REGISTRY/kaito-vllm-racer:$VERSION` and can be
+overridden with `RACER_STREAMING_IMAGE`. No images are built or pushed by tests.
 
 Use Linux amd64 and a digest-pinned, matching KAITO vLLM preset base image.
 The provider targets Ubuntu 22.04 glibc 2.35, compatible with the newer
