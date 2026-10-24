@@ -1,0 +1,300 @@
+# KAITO + Racer 模型流式加载 POC
+
+> **实验性 POC，不是生产支持声明。** 实现位于 `poc/racer-model-streaming`。
+> 设计依据：[racer-kaito-design.md](https://github.com/andyzhangx/demo/blob/master/llm/distributed-cache/racer-kaito-design.md)。
+> 本地 controller/provider 单测、race、真实 `.so` ABI 测试不等于 AKS/GPU 验收。
+> 本次没有部署真实集群、构建 Docker 镜像或测量冷/热缓存性能。
+
+## 1. 实现范围与数据路径
+
+```text
+ModelMirror（已有）→ Azure Blob，不变
+metadata/config/listing → Azure SDK + Workload Identity，不变
+vLLM → Model Streamer Azure backend
+     → libkaito_racer_cache.so（C ABI）
+     → http://127.0.0.1:18080/<blob-key>（Range GET，无 Azure token）
+     → Racer native sidecar → Racer cache server → Azure Blob origin
+```
+
+- 仅支持现有 preset + ModelMirror + ModelStreaming 路径；不是下载整个模型再加载。
+- Provider 导出 `cache_abi_version() == 1`、`blob_read`、`shutdown`。账户/容器逐次严格校验。
+- 精确校验 HTTP 206、Content-Range、返回长度；拒绝部分成功、重定向和非 loopback endpoint。
+- 默认每次读取总超时 30s、最大并发 16、最多 3 次尝试，瞬态错误使用指数退避加 jitter；鉴权、范围、短读错误不重试。
+- 管理员通过 `racerCacheBindings` 授权命名空间及 Azure account/container，Workspace 不能自由指定 sidecar/hostPath。
+- 当前 preset 路径的单节点/多节点 StatefulSet 复用同一个 PodTemplate mutator；所有 rank（不只 head）得到 provider env、runtime image、sidecar。
+- `kaito.sh/model-cache: disabled` 可单独关闭 Racer，而继续使用 Mirror + Streaming。
+- 不支持运行中透明 direct-Azure fail-open。关闭 Racer 后重建工作负载才是可靠的直接 Azure 对照/回滚路径。
+
+## 2. 前置条件
+
+准备独立测试 AKS 集群：
+
+1. Linux amd64 GPU 节点，Kubernetes >= 1.30，支持 native sidecar（initContainer `restartPolicy: Always`）。
+2. 已安装 KAITO、Azure Blob CSI Driver，启用 OIDC issuer 与 Azure Workload Identity。
+3. 已验证普通 [ModelMirror](proposals/20260520-model-mirror.md) 和 [ModelStreaming](../website/docs/model-mirror-streaming.md) 可成功加载同一个 safetensors 模型。
+4. 有私有镜像仓库和有权限推送镜像的 Docker 构建机。
+5. 推理 namespace 中已有 streaming ServiceAccount/FIC；具体绑定必须遵循原 ModelStreaming 文档。
+6. 安装 Racer 前评估其成本、节点缓存磁盘与 hostPath 安全范围。此 POC 不会替你自动创建 Azure 资源。
+
+**模型对象必须不可变。** 用新的容器或 revision 前缀发布新版本；不能覆盖已缓存的同名 blob。
+Provider ABI 没有 ETag/version 参数，本实现不做覆盖写失效保证；缺少安全失效/一致性承诺时不要用可变路径。
+
+## 3. 安装并验证 Racer
+
+采用固定发行版 **Azure/unbounded v0.18.0**；不同版本不要混用 server/sidecar。
+官方文档：[Azure Blob guide](https://unbounded-cloud.io/guides/azure-blob-cache/)、[CLI](https://unbounded-cloud.io/reference/cli/)、[racer-object](https://unbounded-cloud.io/reference/racer-object/)。
+先审阅对应版本帮助与渲染结果，再对测试集群应用。下列为 Linux amd64 构建机操作：
+
+```bash
+curl -fL -o /tmp/kubectl-unbounded \
+  https://github.com/Azure/unbounded/releases/download/v0.18.0/kubectl-unbounded-linux-amd64
+printf '%s  %s\n' \
+  13bc415f9ecdb5091c5de7b633665a45f7b57c7b21d60037f212f218ec26b3668c \
+  /tmp/kubectl-unbounded | sha256sum -c -
+chmod +x /tmp/kubectl-unbounded
+mkdir -p "$HOME/.local/bin"
+cp /tmp/kubectl-unbounded "$HOME/.local/bin/kubectl-unbounded"
+export PATH="$HOME/.local/bin:$PATH"
+kubectl unbounded --help
+kubectl unbounded manage blobs install --help
+```
+
+管理员创建/配置**专用于 Racer origin 的** Azure Managed Identity。它需要：
+
+- 读取目标 Azure Blob 容器的 `Storage Blob Data Reader`（尽量缩小到容器范围）；
+- 当前集群的 Workload Identity FIC，subject 必须匹配 Racer server 实际 ServiceAccount；
+- 对应 ServiceAccount 的 `azure.workload.identity/client-id` annotation 和 server Pod 的 WI label。
+
+**KAITO inference 的 WI 仍保留**，用于 metadata/listing/config；不要把 Azure token/SAS 交给 provider。
+Racer origin 身份和 KAITO streaming 身份可以不同，应分别审计。
+
+```bash
+export CACHE_NAME=kaito-model-cache
+export AZURE_CONTAINER_URI=az://YOUR_ACCOUNT/YOUR_ACTUAL_MIRROR_CONTAINER
+kubectl unbounded manage blobs install "$CACHE_NAME" \
+  --from-container "$AZURE_CONTAINER_URI" \
+  --sku Standard_L8s_v3 --count 2
+```
+
+为刚创建的 cache 配置 origin Workload Identity（该字段已核对 v0.18.0 CRD）：
+
+```bash
+export ORIGIN_CLIENT_ID=YOUR_ORIGIN_MANAGED_IDENTITY_CLIENT_ID
+kubectl patch clustercache "$CACHE_NAME" --type=merge \
+  -p "{\"spec\":{\"origin\":{\"azure\":{\"credential\":{\"default\":null,\"workloadIdentity\":{\"clientID\":\"$ORIGIN_CLIENT_ID\"}}}}}}"
+kubectl get clustercache "$CACHE_NAME" -o yaml
+```
+
+operator 会根据 credential 配置 origin Pod/SA；从实际 origin Pod 的 `spec.serviceAccountName` 和 namespace
+取得 FIC subject `system:serviceaccount:<namespace>:<serviceaccount>`，再建立对应 FIC。
+不能更改既有 cache 的 containerURL；切换容器需创建新 cache。
+
+以下为 FIC/RBAC 命令模板，所有变量都需使用上面实际查到的资源；不要复用 inference 的 subject：
+
+```bash
+OIDC_ISSUER=$(az aks show -g "$AKS_RESOURCE_GROUP" -n "$AKS_NAME" \
+  --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create \
+  --resource-group "$IDENTITY_RESOURCE_GROUP" --identity-name "$ORIGIN_IDENTITY_NAME" \
+  --name kaito-racer-poc --issuer "$OIDC_ISSUER" \
+  --subject "system:serviceaccount:${ORIGIN_NAMESPACE}:${ORIGIN_SERVICEACCOUNT}" \
+  --audiences api://AzureADTokenExchange
+# STORAGE_CONTAINER_RESOURCE_ID 必须是目标 storageAccount/blobServices/default/containers/<container> 的完整 ARM ID。
+az role assignment create --assignee-object-id "$ORIGIN_PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal --role 'Storage Blob Data Reader' \
+  --scope "$STORAGE_CONTAINER_RESOURCE_ID"
+```
+
+
+CLI 会申请缓存资源，SKU/count 仅为示例，需核对区域容量与费用。按官方说明完成 origin 身份配置，
+检查实际部署 YAML、Pod events、server 日志以及一次冷读，不能只凭 Pod Ready 认为鉴权已成功。
+从该发行版部署中取得**实际 server 使用的 racer-object 镜像**，解析并固定为 `@sha256:...`，
+作为后面的 `SIDECAR_IMAGE`，不要猜测镜像仓库地址。
+
+已通过基础 Racer 独立测试后，记下 cache 名。此 POC 与 v0.18.0 sidecar 约定一致，挂载
+`/run/racer/<cache-name>/client`，排除存在 `racer.unbounded-cloud.io/exclude` 标签的节点。
+检查该目录由 Racer node client 创建，socket 权限允许 UID/GID 65532 访问；hostPath 在 Pod Security 中需要管理员许可。
+
+## 4. 找到实际 Mirror account/container
+
+先完成普通 ModelMirror + Streaming，再检查资源：
+
+```bash
+kubectl get modelmirrors -A
+kubectl -n YOUR_WORKSPACE_NAMESPACE get pvc
+# 从 ModelMirror 状态/对应 PVC 选择本模型已经完成 mirror 的 PVC，不要选择任意一个。
+export MIRROR_PVC=YOUR_ACTUAL_MIRROR_PVC
+export WORKSPACE_NAMESPACE=kaito-poc
+PV=$(kubectl -n "$WORKSPACE_NAMESPACE" get pvc "$MIRROR_PVC" -o jsonpath='{.spec.volumeName}')
+kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeAttributes}'
+echo
+```
+
+从 PV 属性/实际 Azure 资源确认 `storageAccount`、`containerName`。动态 CSI 容器经常是 `pvc-...`；
+**不要**使用 StorageClass 名、PVC 名、模型名猜测容器。缺失时由管理员从 Blob CSI 配置解析并确认。
+Racer origin 必须指向这个完整容器；sidecar 中 `/blob-key` 对应容器根目录的 blob key，不能额外重写模型前缀。
+
+## 5. 构建并推送两个 KAITO 镜像
+
+```bash
+git clone --branch poc/racer-model-streaming https://github.com/andyzhangx/kaito.git
+cd kaito
+export REGISTRY=YOUR_REGISTRY.azurecr.io
+export CONTROLLER_TAG=racer-poc-1
+export CONTROLLER_IMAGE="$REGISTRY/kaito/workspace:$CONTROLLER_TAG"
+export RACER_RUNTIME_IMAGE="$REGISTRY/kaito/vllm-racer:poc-1"
+# 来自本提交所对应的 presets/workspace/models/base_images.yaml；解析为实际不可变 digest。
+export KAITO_STREAMING_BASE_IMAGE='YOUR_KAITO_VLLM_PRESET_IMAGE@sha256:YOUR_DIGEST'
+
+docker build -f docker/workspace/Dockerfile -t "$CONTROLLER_IMAGE" .
+docker build -f docker/racer-streaming/Dockerfile \
+  --build-arg KAITO_STREAMING_BASE_IMAGE="$KAITO_STREAMING_BASE_IMAGE" \
+  -t "$RACER_RUNTIME_IMAGE" .
+docker push "$CONTROLLER_IMAGE"
+docker push "$RACER_RUNTIME_IMAGE"
+```
+
+Provider build 使用 Ubuntu 22.04 的 glibc 2.35 兼容基线；当前 preset 使用更新的 Debian bookworm glibc。最终镜像中的 dlopen 检查会拒绝缺少依赖的构建。发行的
+`runai-model-streamer==0.16.0` + `runai-model-streamer-azure==0.16.0` **已经包含所需 ABI**；
+当前 preset requirements 也固定为这个版本。构建会核对两个 wheel 版本、native cache-loader markers，
+并实际 `dlopen` provider，校验三个导出符号。无需额外从上游 main 构建 streamer。
+
+检查失败时不要删除检查、仅设置 env 或改成 `auto` 掩盖失败；应核对 base image/平台/wheel 版本。
+所有 env 都必须在进程启动前注入，不支持在 Python 中动态改 env 后让 Go provider 重新读配置。
+推送完成后，用 registry 返回的实际 digest 替换 deployment 中的 runtime/sidecar 镜像引用。
+
+## 6. 配置控制器的管理员绑定
+
+复制 [values 示例](../examples/racer-model-streaming-values.yaml)，将以下项替换为真实值：
+
+```yaml
+# racer-values.yaml（合并到现有 workspace chart values，不覆盖 WI 等配置）
+featureGates:
+  ModelMirror: true
+  ModelStreaming: true
+racerCacheBindings:
+  - namespace: kaito-poc
+    account: YOUR_ACTUAL_STORAGE_ACCOUNT
+    container: YOUR_ACTUAL_MIRROR_CONTAINER
+    runtimeImage: YOUR_REGISTRY/kaito/vllm-racer@sha256:YOUR_DIGEST
+    objectImage: YOUR_ACTUAL_RACER_OBJECT_IMAGE@sha256:YOUR_DIGEST
+    cacheName: kaito-model-cache
+    immutable: true
+```
+
+`namespace` 是允许使用此绑定的 **Workspace namespace**。数组可以授权多个精确的 namespace/account/container 组合；
+同一个 cacheName 不允许绑定到不同的存储源。控制器从实际 StreamingConfig 再次校验账户/容器，
+不匹配时 fail closed，不会把别的容器静默映射到同一个 Racer cache。
+
+```bash
+# 先 helm list -A 找到已有 workspace chart 的 release/namespace；不要安装第二个 controller。
+helm list -A
+export KAITO_RELEASE=YOUR_EXISTING_WORKSPACE_RELEASE
+export KAITO_NAMESPACE=YOUR_EXISTING_KAITO_NAMESPACE
+helm upgrade "$KAITO_RELEASE" ./charts/kaito/workspace \
+  --namespace "$KAITO_NAMESPACE" --reuse-values \
+  --set image.repository="$REGISTRY/kaito/workspace" \
+  --set image.tag="$CONTROLLER_TAG" \
+  -f racer-values.yaml
+```
+
+`--reuse-values` 保留原配置；仍需检查最终渲染结果，特别是 WI、ServiceAccount、feature gates。
+如果原安装是另一套 chart/AKS 托管 add-on，不要盲目执行该命令覆盖它；在独立测试集群安装本 chart，
+或者按原安装方式更新 workspace controller 镜像及 `--racer-cache-bindings` JSON 参数。
+
+## 7. 启动新的测试 Workspace
+
+使用你已经成功验证直接 Azure Streaming 的同一个 preset/spec，新增：
+
+```yaml
+metadata:
+  annotations:
+    kaito.sh/model-cache: racer
+    kaito.sh/streaming-service-account: model-reader
+```
+
+Workspace 样例在 [examples/racer-model-streaming-poc.yaml](../examples/racer-model-streaming-poc.yaml)，
+controller values 在 [examples/racer-model-streaming-values.yaml](../examples/racer-model-streaming-values.yaml)。
+Mirror/Streaming 由 feature gates 开启；不要设置 `kaito.sh/model-streaming: disabled`。
+`immutable: true` 是管理员 binding 的承诺，不是 Workspace 可以自行声明的授权。
+样例默认 **单节点**，先完成单节点正确性验收，再按既有多节点 preset 方法配置 tensor/pipeline parallelism，
+不能仅把 nodeCount 从 1 改为 2 就认为模型并行配置正确。
+
+**用新 Workspace 测试。** 当前已有 StatefulSet 更新逻辑不更新所有 initContainer/affinity 字段。
+修改 Racer annotation、binding 或 sidecar 镜像后，单纯 patch/rollout restart 旧 StatefulSet 不一定收敛。
+应保存 Workspace YAML、停止测试流量，并删除它管理的 StatefulSet，让 controller 从新模板重建。
+先核对对象 ownerReferences 和数据保留策略，避免误删镜像 PVC、ModelMirror 或非 POC 对象。
+
+## 8. 验证：所有 rank，而不只是 head
+
+```bash
+kubectl -n "$WORKSPACE_NAMESPACE" get sts,pods -o wide
+# 选定 POC 的 StatefulSet 后检查 spec.template（包括 initContainers 与 affinity）。
+kubectl -n "$WORKSPACE_NAMESPACE" get sts YOUR_POC_STATEFULSET -o yaml
+kubectl -n "$WORKSPACE_NAMESPACE" logs YOUR_POC_POD -c racer-object
+kubectl -n "$WORKSPACE_NAMESPACE" logs YOUR_POC_POD -c YOUR_INFERENCE_CONTAINER
+```
+
+每个 Pod/rank 应具备：
+
+- 同一个 digest-pinned provider runtime；非 sidecar 的 initContainers 保留原镜像。
+- `RUNAI_STREAMER_EXPERIMENTAL_AZURE_CACHE_ENABLED=1`、正确的 `_LIB` 路径。
+- `KAITO_RACER_ENDPOINT=http://127.0.0.1:18080` 和正确 account/container。
+- 名为 `racer-object` 的 native sidecar、只读 socket mount、原 streaming SA/WI 设置。
+- 排除 cache-server node 的 affinity；controller 保留原有 affinity 约束。
+- Model Streamer 日志确认 cache provider loaded；缓存指标/日志能证明读取确实命中 Racer。
+
+PodTemplate 注入并不等于 Ray env 已传递成功；必须检查每个实际 worker 的加载日志及 cache 访问。
+sidecar 首次启动/重启竞态可能导致有界读取失败，之后由工作负载重启恢复；此 POC 没有跨进程无损续读保证。
+
+### 正确性及性能验收矩阵
+
+| 场景 | 必须验证 |
+|---|---|
+| 关闭 Racer 的基线 | 同一模型 revision、GPU、节点数、batch/并行设置，ModelReady 与 smoke inference 成功 |
+| 冷缓存 | 新缓存/已确认清空的测试 cache；分开记录 mirror 时间与 model-load 时间、origin bytes、错误率 |
+| 热缓存 | 重启同样的 inference Pod，不重启/清除 Racer；核对 cache hit、origin bytes、输出正确性 |
+| 第二 rank/第二节点 | 每个 rank 的加载日志、正确性和缓存命中均验证，不以 head 日志替代 |
+| 非零/16 MiB 跨界读取 | 将 cache range 与同一不可变 Azure blob 的相同字节范围逐字节比较 |
+| sidecar 停止/server 重启 | 有界失败、无错误成功或挂死；恢复后的完整重试结果正确 |
+| origin 403、404、429/503 | 权限/不存在立即失败；仅瞬态错误按界限重试；不泄漏凭据 |
+| immutable 前提 | 容器/revision 不覆盖写；若变更则用新的 immutable 路径/cache 绑定 |
+
+分别记录 time-to-ModelReady、加载吞吐、每个 rank 时间、Racer hit/origin bytes、失败率及首次推理结果。
+**本次没有实测性能数据，不宣称提升倍数。** 不要在共享/生产 cache 上做破坏性故障注入。
+
+## 9. 回滚
+
+1. 将 Workspace 的 `kaito.sh/model-cache` 改为 `disabled`。
+2. 保持 Mirror/Streaming feature gates 开启；按第 7 节重建该 POC 工作负载，验证 sidecar/provider env 已消失、原 preset image 恢复。
+3. 确认直接 Azure Streaming 与 smoke inference 成功。
+4. 若不再测试，移除 controller Racer binding；再按原 Helm revision 回滚控制器。
+5. 最后按 Racer 官方步骤清理仅属于此次 POC 的 cache 资源和 RBAC；不要删除共享 Blob 数据。
+
+## 10. 本地测试
+
+```bash
+go test ./pkg/workspace/inference/... ./cmd/workspace
+go vet ./pkg/workspace/inference/... ./cmd/workspace
+go build ./cmd/workspace
+helm lint charts/kaito/workspace
+cd tools/racer-cache-provider
+CGO_ENABLED=1 go test -race ./...
+CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/libkaito_racer_cache.so .
+python3 test_abi.py /tmp/libkaito_racer_cache.so
+```
+
+CGO 需要 C 编译器与 glibc 开发工具。本地 ABI 测试调用真正编译的 `.so`，使用 loopback mock server；
+覆盖 ABI 版本、并发 C 调用、精确/跨界读取、授权绑定、短读/403、空指针、整数溢出、有限错误缓冲、shutdown 后重用和无凭据转发。
+它不能替代真实 Racer server、Azure WI 或 GPU 推理验收。
+
+## 11. 此分支的验证记录（2026-10-24）
+
+- 通过：`CGO_ENABLED=0 go test ./pkg/... ./api/... ./presets/...`；最终改动后又运行推理相关包及 workspace cmd 单测。
+- 通过：推理相关包/workspace cmd 的 `go vet`、workspace controller 编译。
+- 通过：独立 provider 模块 `go test -race`、`go vet`、实际 `c-shared` 编译和 9 项 Python ctypes ABI 测试。
+- 通过：从 PyPI 下载并核验 SHA-256 的 core/Azure 0.16.0 wheel，与真实 `.so` 一起执行 runtime capability check。
+- 通过：Helm lint、开/关两种配置的 template 渲染及 flag JSON 一致性、示例 YAML 与相对链接校验、ruff、gofmt、diff whitespace 检查。
+- 未执行：Docker 镜像构建/推送、真实 AKS/Racer/WI/GPU 测试、冷/热性能测试、全仓库 race 和完整 golangci-lint。
+- 环境没有 make 和系统 C 编译器；provider 本地测试使用临时 Zig 0.14.1 GNU-target 编译器。它不是最终 Docker 构建结果。
+- 独立审查服务不可用；进行了源代码/官方 ABI 与配置一致性自查，但不标记为独立审查通过。

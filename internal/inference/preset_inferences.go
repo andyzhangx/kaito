@@ -274,6 +274,9 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 
 	// Resolve streaming configuration
 	streamingEnabled := modelstreaming.ModelStreamingEnabled(workspaceObj)
+	if err := modelstreaming.ValidateRacerRequest(workspaceObj, streamingEnabled); err != nil {
+		return nil, err
+	}
 	var streamingModelPath, streamingLoadFormat string
 	var streamingCfg *modelstreaming.StreamingConfig
 	var modelID string
@@ -350,6 +353,18 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 			for k, v := range podLabels {
 				ss.Spec.Template.Labels[k] = v
 			}
+			return nil
+		})
+	}
+
+	if streamingEnabled && workspaceObj.Annotations[modelstreaming.AnnotationModelCache] == "racer" {
+		ssOpts = append(ssOpts, func(ctx *builder.WorkspaceGeneratorContext, ss *appsv1.StatefulSet) error {
+			if ss.Spec.Template.Annotations == nil {
+				ss.Spec.Template.Annotations = make(map[string]string)
+			}
+			// Only vLLM reads Blob origin. The cache-only sidecar must not
+			// receive vLLM's Azure Workload Identity credentials.
+			ss.Spec.Template.Annotations["azure.workload.identity/skip-containers"] = "racer-object"
 			return nil
 		})
 	}
