@@ -5,6 +5,75 @@
 > 本地 controller/provider 单测、race、真实 `.so` ABI 测试不等于 AKS/GPU 验收。
 > 本次没有部署真实集群、构建 Docker 镜像或测量冷/热缓存性能。
 
+## 快速开始：五步部署
+
+建议先在**独立测试 AKS 集群**跑单节点，成功后再验证多节点。以下是部署摘要；身份配置、实际参数来源、验收和回滚见后面的详细章节。
+
+### 第一步：准备基础环境
+
+先确认普通 **KAITO ModelMirror + ModelStreaming** 能加载目标模型。需要 GPU 节点、Blob CSI、Workload Identity，以及已经完成 mirror 的模型容器。具体前置条件见第 2 节。
+
+### 第二步：安装 Racer
+
+使用固定版本 **Azure/unbounded v0.18.0**，按第 3 节完成安装及 origin 身份、FIC/RBAC 配置。
+
+**Racer origin 必须指向 ModelMirror 实际使用的 Azure account/container**，不能根据模型名或 PVC 名猜测。第 4 节说明如何确认实际容器；模型对象必须保持不可变。
+
+### 第三步：构建并推送两个镜像
+
+```bash
+git clone --branch poc/racer-model-streaming \
+  https://github.com/andyzhangx/kaito.git
+cd kaito
+
+# 先按第 5 节设置为你自己的镜像地址及兼容的、digest-pinned KAITO preset base。
+: "${CONTROLLER_IMAGE:?请设置控制器镜像地址}"
+: "${RACER_RUNTIME_IMAGE:?请设置 Racer runtime 镜像地址}"
+: "${KAITO_STREAMING_BASE_IMAGE:?请设置兼容的 KAITO vLLM preset base 镜像}"
+
+docker build -f docker/workspace/Dockerfile \
+  -t "$CONTROLLER_IMAGE" .
+
+docker build -f docker/racer-streaming/Dockerfile \
+  --build-arg KAITO_STREAMING_BASE_IMAGE="$KAITO_STREAMING_BASE_IMAGE" \
+  -t "$RACER_RUNTIME_IMAGE" .
+
+docker push "$CONTROLLER_IMAGE"
+docker push "$RACER_RUNTIME_IMAGE"
+```
+
+第二个镜像是在现有 KAITO vLLM preset 镜像中加入 provider；构建时会检查实际 Streamer ABI。镜像构建、注册表认证和推送需要由部署者在有 Docker 的构建机执行，本 POC 的本地测试没有替代这些步骤。
+
+### 第四步：更新控制器配置
+
+修改并使用 [Helm values 示例](../examples/racer-model-streaming-values.yaml)，填写：
+
+- Workspace namespace；
+- 实际 storage account/container；
+- Racer cache 名及 sidecar 镜像；
+- 新构建的 runtime 镜像。
+
+通过**现有 workspace chart** 升级控制器并应用 `racerCacheBindings`，保留原有 WI 等配置。第 6 节提供 Helm 命令及不同安装方式的注意事项；不要在已有控制器旁盲目安装第二个控制器。
+
+### 第五步：创建新的测试 Workspace
+
+修改 [Workspace 示例](../examples/racer-model-streaming-poc.yaml) 中的身份和 GPU 配置，完成对应 FIC 后再应用。启用开关是：
+
+```yaml
+metadata:
+  annotations:
+    kaito.sh/model-cache: racer
+    kaito.sh/streaming-service-account: model-reader
+```
+
+每个推理 rank 都会获得 provider 配置及 `racer-object` sidecar。**先用新 Workspace 测试**；旧 StatefulSet 的部分字段不会仅靠修改 annotation 自动更新。具体操作见第 7 节，并按第 8 节检查所有 rank，而不只是 head。
+
+### 验证状态与回滚
+
+已通过 Go 单测、provider race 测试、**9 项真实 `.so` ABI 测试**、控制器编译及 Helm 渲染检查。
+
+**尚未进行 Docker 镜像构建和真实 AKS/GPU 部署验证，也没有冷／热缓存性能数据。** 第 8 节包含逐 rank 检查、冷／热缓存验收及故障测试，第 9 节包含回滚步骤，第 11 节记录完整验证范围和限制。
+
 ## 1. 实现范围与数据路径
 
 ```text
