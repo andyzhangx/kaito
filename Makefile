@@ -278,6 +278,12 @@ RAGENGINE_SERVICE_APP_VERSION := $(subst v,,$(RAGENGINE_SERVICE_IMG_TAG))
 KAITO_BASE_IMG_NAME ?= kaito-base
 KAITO_BASE_IMG_TAG ?= v0.0.1
 
+# Racer POC uses the existing vLLM preset base plus a separate provider layer.
+# Build the base target, or override it with an existing compatible image/digest.
+KAITO_STREAMING_BASE_IMAGE ?= $(REGISTRY)/kaito-streaming-base:$(IMG_TAG)
+RACER_STREAMING_IMAGE ?= $(REGISTRY)/kaito-vllm-racer:$(IMG_TAG)
+PLATFORMS ?= linux/$(ARCH)
+
 MT_BENCH_IMG_NAME ?= mt-bench-eval
 MT_BENCH_IMG_TAG ?= v0.0.1
 
@@ -307,6 +313,46 @@ docker-build-workspace: docker-buildx ## Build Docker image for workspace.
 		--pull \
 		$(BUILD_FLAGS) \
 		--tag $(REGISTRY)/$(IMG_NAME):$(IMG_TAG) .
+
+.PHONY: check-racer-build-config
+check-racer-build-config: ## Validate Racer POC image/platform settings before invoking Docker.
+	@test "$(ARCH)" = amd64 && test "$(PLATFORMS)" = linux/amd64 || \
+		{ echo 'Racer POC supports only ARCH=amd64 and PLATFORMS=linux/amd64.' >&2; exit 1; }
+	@test -n "$(strip $(KAITO_STREAMING_BASE_IMAGE))" || \
+		{ echo 'KAITO_STREAMING_BASE_IMAGE must be non-empty.' >&2; exit 1; }
+	@test -n "$(strip $(RACER_STREAMING_IMAGE))" || \
+		{ echo 'RACER_STREAMING_IMAGE must be non-empty.' >&2; exit 1; }
+
+.PHONY: docker-build-kaito-streaming-base
+docker-build-kaito-streaming-base: check-racer-build-config ## Build KAITO_STREAMING_BASE_IMAGE with the existing vLLM/Streamer preset Dockerfile.
+	@case "$(KAITO_STREAMING_BASE_IMAGE)" in *@*) \
+		echo 'Building KAITO_STREAMING_BASE_IMAGE requires a tag, not a digest.' >&2; exit 1;; esac
+	$(MAKE) docker-buildx
+	docker buildx build \
+		--file ./docker/presets/models/tfs/Dockerfile \
+		--output="$(OUTPUT_TYPE)" \
+		--platform="$(PLATFORMS)" \
+		--build-arg VERSION="$(IMG_TAG)" \
+		--build-arg MODEL_TYPE=text-generation \
+		--pull \
+		$(BUILD_FLAGS) \
+		--tag "$(KAITO_STREAMING_BASE_IMAGE)" .
+
+.PHONY: docker-build-racer-streaming
+docker-build-racer-streaming: check-racer-build-config ## Build Racer runtime from a registry-accessible KAITO_STREAMING_BASE_IMAGE.
+	@test "$(KAITO_STREAMING_BASE_IMAGE)" != "$(RACER_STREAMING_IMAGE)" || \
+		{ echo 'RACER_STREAMING_IMAGE must differ from KAITO_STREAMING_BASE_IMAGE.' >&2; exit 1; }
+	@case "$(RACER_STREAMING_IMAGE)" in *@*) \
+		echo 'RACER_STREAMING_IMAGE output requires a tag, not a digest.' >&2; exit 1;; esac
+	$(MAKE) docker-buildx
+	docker buildx build \
+		--file ./docker/racer-streaming/Dockerfile \
+		--output="$(OUTPUT_TYPE)" \
+		--platform="$(PLATFORMS)" \
+		--build-arg KAITO_STREAMING_BASE_IMAGE="$(KAITO_STREAMING_BASE_IMAGE)" \
+		--pull \
+		$(BUILD_FLAGS) \
+		--tag "$(RACER_STREAMING_IMAGE)" .
 
 .PHONY: docker-build-ragengine
 docker-build-ragengine: docker-buildx ## Build Docker image for RAG Engine.
