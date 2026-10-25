@@ -31,22 +31,24 @@ export OUTPUT_TYPE="type=docker"
 export ARCH="amd64"
 export PLATFORMS=linux/amd64
 export VERSION=0.13.0-racer
-export KAITO_STREAMING_BASE_IMAGE="$REGISTRY/kaito-streaming-base:$VERSION"
+export KAITO_BASE_IMG_NAME=kaito-base
+export KAITO_BASE_IMG_TAG="$VERSION"
 export RACER_STREAMING_IMAGE="$REGISTRY/kaito-vllm-racer:$VERSION"
 
 make docker-build-workspace ARCH=amd64
-make docker-build-kaito-streaming-base ARCH=amd64
+# 仅当指定的 kaito-base 不存在或不兼容时才需要构建和推送。
+make docker-build-kaito-base ARCH=amd64
 
 # type=docker 将镜像加载到本机 Docker，不会推送到仓库。
 # docker-container buildx builder 通常无法直接使用本机 daemon 中的 base：先推送。
-docker push "$KAITO_STREAMING_BASE_IMAGE"
+docker push "$REGISTRY/$KAITO_BASE_IMG_NAME:$KAITO_BASE_IMG_TAG"
 make docker-build-racer-streaming ARCH=amd64
 
 docker push "$REGISTRY/workspace:$VERSION"
 docker push "$RACER_STREAMING_IMAGE"
 ```
 
-最终 Racer runtime 镜像是在 KAITO vLLM preset base 中加入 provider；构建时会检查实际 Streamer ABI。若已有兼容的仓库 base，可直接设置 `KAITO_STREAMING_BASE_IMAGE` 为其版本 tag/digest，跳过 base 构建和推送。镜像构建、注册表认证和推送需要由部署者在有 Docker 的构建机执行，本 POC 的本地测试没有替代这些步骤。
+最终 Racer runtime 镜像是在 KAITO vLLM preset base 中加入 provider；构建时会检查实际 Streamer ABI。若已有兼容的仓库 kaito-base，设置已有的 `REGISTRY`、`KAITO_BASE_IMG_NAME`、`KAITO_BASE_IMG_TAG` 指向它，跳过 base 构建和推送。镜像构建、注册表认证和推送需要由部署者在有 Docker 的构建机执行，本 POC 的本地测试没有替代这些步骤。
 
 ### 第四步：更新控制器配置
 
@@ -207,52 +209,36 @@ echo
 **不要**使用 StorageClass 名、PVC 名、模型名猜测容器。缺失时由管理员从 Blob CSI 配置解析并确认。
 Racer origin 必须指向这个完整容器；sidecar 中 `/blob-key` 对应容器根目录的 blob key，不能额外重写模型前缀。
 
-## 5. 使用 Makefile 构建控制器、streaming base 和 Racer runtime
+## 5. 使用 Makefile 构建控制器和 Racer runtime
 
-### `KAITO_STREAMING_BASE_IMAGE` 是做什么的？
+### 直接复用现有 `kaito-base`
 
-`KAITO_STREAMING_BASE_IMAGE` 是**构建 Racer 推理镜像时使用的基础镜像地址**。它提供已有的 KAITO preset 推理环境，包括 **vLLM、Ray 和 Model Streamer**；Racer runtime 构建再在其上加入 `libkaito_racer_cache.so`，让 Streamer 的模型数据读取接入 Racer。
-
-同一个变量在两个 Make 目标中承担不同角色：
-
-| Make 目标 | `KAITO_STREAMING_BASE_IMAGE` 的作用 |
-|---|---|
-| `docker-build-kaito-streaming-base` | **输出镜像名**：将现有 KAITO vLLM preset Dockerfile 构建为这个 tag |
-| `docker-build-racer-streaming` | **输入基础镜像**：通过 Dockerfile 的 `FROM ${KAITO_STREAMING_BASE_IMAGE}` 继承推理环境，再加入并检查 provider |
+**不需要另一种 streaming base 镜像或额外的 base 构建目标。** Racer runtime 直接使用现有 `make docker-build-kaito-base` 构建的镜像，其输入地址由已有变量组成：
 
 ```text
-现有 KAITO vLLM preset Dockerfile
-        │
-        ▼
-KAITO_STREAMING_BASE_IMAGE
-  vLLM + Ray + Model Streamer
-        │
-        │ 加入 libkaito_racer_cache.so
-        │ 检查 Streamer ABI 和 provider 加载
-        ▼
-RACER_STREAMING_IMAGE
-  最终部署到推理容器的 runtime 镜像
+${REGISTRY}/${KAITO_BASE_IMG_NAME}:${KAITO_BASE_IMG_TAG}
 ```
 
-**基础镜像不是一个需要额外部署的容器，也不是 Racer cache server 或 `racer-object` sidecar 的镜像。** 各镜像的用途分别是：
+现有 `docker/presets/models/tfs/Dockerfile` 已包含 vLLM、Ray 和 Model Streamer。Racer 构建只在这套环境上加入 `libkaito_racer_cache.so` 并校验兼容性：
 
-- `CONTROLLER_IMAGE`：运行 KAITO Workspace 控制器。
-- `KAITO_STREAMING_BASE_IMAGE`：构建阶段使用的推理底座，其内容由最终 runtime 镜像继承。
-- `RACER_STREAMING_IMAGE`（部署示例中赋给 `RACER_RUNTIME_IMAGE`）：运行 vLLM 推理进程，包含 Racer provider。
-- 管理员绑定中的 `objectImage`：单独运行 `racer-object` sidecar；它不是由上述 base/runtime 目标构建的。
-
-**已有兼容 base 时，不必重新构建它。** 将变量指向 registry 中现有的 tag 或 digest，只构建最终 Racer runtime 即可，例如：
-
-```bash
-# 先按下方完整构建示例设置 REGISTRY、VERSION、OUTPUT_TYPE、ARCH 和 PLATFORMS。
-# 将占位地址替换为真实、兼容且可拉取的基础镜像。
-export KAITO_STREAMING_BASE_IMAGE="YOUR_REGISTRY/compatible-kaito-streaming-base:YOUR_TAG"
-make docker-build-racer-streaming ARCH=amd64
+```text
+已有 kaito-base（vLLM + Ray + Model Streamer）
+        │
+        │ 加入 Racer provider 并检查 ABI
+        ▼
+RACER_STREAMING_IMAGE（最终推理容器镜像）
 ```
 
-这只跳过 base 的构建和推送；控制器仍需使用本 POC 的代码构建/部署。不能任意换成普通 vLLM 镜像或任意版本的 `kaito-base`：当前 POC 需要 KAITO preset 运行环境，以及 `runai-model-streamer==0.16.0`、`runai-model-streamer-azure==0.16.0` 和对应 cache ABI。最终 runtime 构建会检查兼容性，失败时应修正 base，而不是跳过检查。
+`docker/racer-streaming/Dockerfile` 内部用 `ARG KAITO_BASE_IMAGE` / `FROM ${KAITO_BASE_IMAGE}` 接收 Make 自动拼出的地址；**不需要额外设置一个 base 镜像地址变量**。
 
-### 完整构建与推送示例
+- `CONTROLLER_IMAGE`：包含本 POC 编排逻辑的 KAITO Workspace 控制器镜像。
+- `REGISTRY`、`KAITO_BASE_IMG_NAME`、`KAITO_BASE_IMG_TAG`：复用现有 kaito-base 构建配置。base 不是额外运行的容器。
+- `RACER_STREAMING_IMAGE`（部署时赋给 `RACER_RUNTIME_IMAGE`）：最终推理镜像，包含 Racer provider。
+- 管理员 binding 中的 `objectImage`：单独的 `racer-object` sidecar 镜像，不由这里的目标构建。
+
+### 构建与推送
+
+以下命令在本 POC 分支的仓库根目录、具备 Docker/buildx 和 registry 权限的构建机执行：
 
 ```bash
 git clone --branch poc/racer-model-streaming \
@@ -260,21 +246,21 @@ git clone --branch poc/racer-model-streaming \
 cd kaito
 
 export REGISTRY=andyzhangx
-export OUTPUT_TYPE="type=docker"
-export ARCH="amd64"
+export OUTPUT_TYPE=type=docker
+export ARCH=amd64
 export PLATFORMS=linux/amd64
 export VERSION=0.13.0-racer
-export KAITO_STREAMING_BASE_IMAGE="$REGISTRY/kaito-streaming-base:$VERSION"
+export KAITO_BASE_IMG_NAME=kaito-base
+export KAITO_BASE_IMG_TAG="$VERSION"
 export RACER_STREAMING_IMAGE="$REGISTRY/kaito-vllm-racer:$VERSION"
 
 make docker-build-workspace ARCH=amd64
-make docker-build-kaito-streaming-base ARCH=amd64
 
-# type=docker 将镜像加载到本机 Docker，不会推送到仓库。
-# docker-container buildx builder 通常无法直接使用本机 daemon 中的 base：先推送。
-docker push "$KAITO_STREAMING_BASE_IMAGE"
+# 仅当这个 kaito-base 镜像不存在或不兼容时执行；已有兼容镜像可跳过这两行。
+make docker-build-kaito-base ARCH=amd64
+docker push "$REGISTRY/$KAITO_BASE_IMG_NAME:$KAITO_BASE_IMG_TAG"
+
 make docker-build-racer-streaming ARCH=amd64
-
 export CONTROLLER_TAG="$VERSION"
 export CONTROLLER_IMAGE="$REGISTRY/workspace:$CONTROLLER_TAG"
 export RACER_RUNTIME_IMAGE="$RACER_STREAMING_IMAGE"
@@ -282,31 +268,27 @@ docker push "$CONTROLLER_IMAGE"
 docker push "$RACER_STREAMING_IMAGE"
 ```
 
-三个 Make 目标与镜像默认值：
+**已有兼容的 kaito-base 时，设置这三个已有变量指向它，跳过 base 构建/推送即可。** 例如已有 `registry.example/team/kaito-base:tested`，设置 `REGISTRY=registry.example/team`、`KAITO_BASE_IMG_NAME=kaito-base`、`KAITO_BASE_IMG_TAG=tested`，然后执行 `make docker-build-racer-streaming ARCH=amd64`。最终 runtime 地址可以通过 `RACER_STREAMING_IMAGE` 独立指定。
 
-| 目标 | 构建结果 |
+| 目标 | 上述示例的结果 |
 |---|---|
 | `docker-build-workspace ARCH=amd64` | `andyzhangx/workspace:0.13.0-racer` |
-| `docker-build-kaito-streaming-base ARCH=amd64` | `KAITO_STREAMING_BASE_IMAGE`，默认 `andyzhangx/kaito-streaming-base:0.13.0-racer` |
-| `docker-build-racer-streaming ARCH=amd64` | `RACER_STREAMING_IMAGE`，默认 `andyzhangx/kaito-vllm-racer:0.13.0-racer` |
+| `docker-build-kaito-base ARCH=amd64`（可选） | `andyzhangx/kaito-base:0.13.0-racer` |
+| `docker-build-racer-streaming ARCH=amd64` | `andyzhangx/kaito-vllm-racer:0.13.0-racer` |
 
-- 替换 `REGISTRY` 为有权限推送的仓库/namespace，提前完成 `docker login`。
-- 新增的两个目标复用 `OUTPUT_TYPE`、`BUILD_FLAGS` 和现有 `docker-buildx` builder；`VERSION` 通过现有 `IMG_TAG` 规则决定默认镜像 tag。
-- POC 仅支持 `ARCH=amd64`、`PLATFORMS=linux/amd64`，其他平台会在调用 Docker 前报错。已有 workspace target 不变，其平台由命令行 `ARCH=amd64` 决定。
-- `KAITO_STREAMING_BASE_IMAGE` 是 base 目标的**输出名称**，也是 Racer 目标的**输入镜像**；`RACER_STREAMING_IMAGE` 是最终 runtime 的输出名称，不要混淆二者。
-- base 使用现有 `docker/presets/models/tfs/Dockerfile`，同时包含 vLLM、Ray 和固定版本的 Streamer；不是普通 `kaito-base` 镜像的任意版本都兼容。
-- 已有兼容 base 时，只执行 workspace 和 Racer 目标。消费已有 base 可用 `@sha256`；构建输出必须使用 tag。
-- `OUTPUT_TYPE=type=docker` 只加载到本机。Racer 构建使用 `--pull`，其 base 必须可被 buildx 从 registry 拉取；这两个目标不会隐藏地自动推送 base。
-- 若希望 buildx 在构建成功后直接推送，可显式设置 `OUTPUT_TYPE=type=registry`；这样不要再依赖本机存在对应镜像，也不必重复执行上面的 `docker push`。本文没有实际执行镜像构建/推送。
+- 现有 base 默认名称为 `kaito-base`、默认 tag 为 `v0.0.1`。**`KAITO_BASE_IMG_TAG` 不会随 `VERSION` 自动变化**，所以上例显式设置；Racer 输出的默认 tag 则沿用 `IMG_TAG` / `VERSION` 规则。
+- Racer 目标仅支持 `ARCH=amd64`、`PLATFORMS=linux/amd64`，无效平台/空配置会在调用 Docker 前报错。原有 workspace/base 目标不变。
+- 当前 Make 接口按现有 base 的 name/tag 组成输入地址；最终 runtime 必须使用不同的输出 tag，不能覆盖 base。
+- `OUTPUT_TYPE=type=docker` 只加载本机镜像，不会推送。Racer 构建使用 `--pull`，base 必须能从 registry 拉取；该目标不会自动构建或推送 base。
+- 可显式使用 `OUTPUT_TYPE=type=registry` 让 buildx 直接推送，此时不要再依赖本机有镜像或重复 `docker push`。
 
-Provider build 使用 Ubuntu 22.04 的 glibc 2.35 兼容基线；当前 preset 使用更新的 Debian bookworm glibc。最终镜像中的 dlopen 检查会拒绝缺少依赖的构建。发行的
-`runai-model-streamer==0.16.0` + `runai-model-streamer-azure==0.16.0` **已经包含所需 ABI**；
-当前 preset requirements 也固定为这个版本。构建会核对两个 wheel 版本、native cache-loader markers，
-并实际 `dlopen` provider，校验三个导出符号。无需额外从上游 main 构建 streamer。
+### 保留兼容性校验
 
-检查失败时不要删除检查、仅设置 env 或改成 `auto` 掩盖失败；应核对 base image/平台/wheel 版本。
-所有 env 都必须在进程启动前注入，不支持在 Python 中动态改 env 后让 Go provider 重新读配置。
-推送完成后，用 registry 返回的实际 digest 替换 deployment 中的 runtime/sidecar 镜像引用。
+复用的是**兼容的** kaito-base，不是任意旧版本。当前 POC 要求对应的 KAITO preset 代码及 `runai-model-streamer==0.16.0`、`runai-model-streamer-azure==0.16.0`；当前分支的 requirements 已固定这两个版本。
+
+Provider 使用 Ubuntu 22.04 / glibc 2.35 构建，当前 preset 使用 Debian bookworm / glibc 2.36。最终镜像构建会检查 wheel 版本、native cache-loader markers，并实际 `dlopen` provider，校验 `cache_abi_version`、`blob_read`、`shutdown`。检查失败应修正 base，不要跳过检查。无需从上游 main 额外构建 Streamer。
+
+构建命令测试使用 mock Docker，**不代表已经构建/推送真实镜像或完成 AKS/GPU、Racer 连接与冷/热缓存验收**。
 
 ## 6. 配置控制器的管理员绑定
 
@@ -455,4 +437,4 @@ CGO 需要 C 编译器与 glibc 开发工具。本地 ABI 测试调用真正编�
 
 ### Makefile 构建入口补充验证
 
-新增 `docker-build-kaito-streaming-base` 与 `docker-build-racer-streaming` 后，使用临时编译的 GNU Make 4.4.1 通过 7 项构建命令回归测试（含并行执行时的失败前置校验）。Docker 被 mock；没有实际构建或推送镜像。Python ruff、文档 shell 语法/链接及 diff 格式检查通过。
+Racer 构建已统一复用现有 `docker-build-kaito-base` 配置；GNU Make 4.4.1 的 8 项构建命令回归测试通过，覆盖共享 name/tag、默认值、覆盖配置、平台校验和并行执行时的失败前置校验。Docker 被 mock；没有实际构建或推送镜像。Python ruff、文档 shell 语法/链接及 diff 格式检查通过。

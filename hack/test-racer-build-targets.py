@@ -52,7 +52,7 @@ class RacerBuildTargets(unittest.TestCase):
         go.chmod(0o755)
         self.env = dict(os.environ)
         for key in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEFILES",
-                    "KAITO_STREAMING_BASE_IMAGE", "RACER_STREAMING_IMAGE", "IMG_TAG",
+                    "KAITO_BASE_IMG_NAME", "KAITO_BASE_IMG_TAG", "RACER_STREAMING_IMAGE", "IMG_TAG",
                     "IMG_NAME", "BUILD_FLAGS"):
             self.env.pop(key, None)
         self.env.update(PATH=str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -76,36 +76,51 @@ class RacerBuildTargets(unittest.TestCase):
         return builds[0]
 
     def test_base_default_image_and_preset(self):
-        _, calls = self.run_make("docker-build-kaito-streaming-base", "ARCH=amd64")
+        _, calls = self.run_make("docker-build-kaito-base", "ARCH=amd64")
         call = self.build_call(calls)
         self.assertIn("--platform=linux/amd64", call)
         self.assertIn("--output=type=docker", call)
         self.assertIn("./docker/presets/models/tfs/Dockerfile", call)
-        self.assertIn("VERSION=0.13.0-racer", call)
+        self.assertIn("VERSION=v0.0.1", call)
         self.assertIn("MODEL_TYPE=text-generation", call)
-        self.assertEqual(call[call.index("--tag") + 1], "andyzhangx/kaito-streaming-base:0.13.0-racer")
+        self.assertEqual(call[call.index("--tag") + 1], "andyzhangx/kaito-base:v0.0.1")
 
     def test_runtime_default_images(self):
         _, calls = self.run_make("docker-build-racer-streaming", "ARCH=amd64")
         call = self.build_call(calls)
         self.assertIn("./docker/racer-streaming/Dockerfile", call)
-        self.assertIn("KAITO_STREAMING_BASE_IMAGE=andyzhangx/kaito-streaming-base:0.13.0-racer", call)
+        self.assertIn("KAITO_BASE_IMAGE=andyzhangx/kaito-base:v0.0.1", call)
         self.assertIn("--platform=linux/amd64", call)
         self.assertIn("--output=type=docker", call)
         self.assertIn("--pull", call)
         self.assertEqual(call[call.index("--tag") + 1], "andyzhangx/kaito-vllm-racer:0.13.0-racer")
 
     def test_overrides_and_registry_output(self):
-        base = "registry.example/base@sha256:" + "a" * 64
-        _, calls = self.run_make("docker-build-racer-streaming", "KAITO_STREAMING_BASE_IMAGE=" + base,
+        base = "registry.example/team/base:custom"
+        _, calls = self.run_make("docker-build-racer-streaming", "REGISTRY=registry.example",
+                                 "KAITO_BASE_IMG_NAME=team/base", "KAITO_BASE_IMG_TAG=custom",
                                  "RACER_STREAMING_IMAGE=registry.example/racer:custom",
                                  "OUTPUT_TYPE=type=registry", "BUILD_FLAGS=--no-cache --progress=plain")
         call = self.build_call(calls)
-        self.assertIn("KAITO_STREAMING_BASE_IMAGE=" + base, call)
+        self.assertIn("KAITO_BASE_IMAGE=" + base, call)
         self.assertIn("--output=type=registry", call)
         self.assertIn("--no-cache", call)
         self.assertIn("--progress=plain", call)
         self.assertEqual(call[call.index("--tag") + 1], "registry.example/racer:custom")
+
+    def test_existing_base_overrides_match_runtime_input(self):
+        args = ("REGISTRY=registry.example", "KAITO_BASE_IMG_NAME=team/base", "KAITO_BASE_IMG_TAG=custom")
+        _, calls = self.run_make("docker-build-kaito-base", *args)
+        base_call = self.build_call(calls)
+        base = base_call[base_call.index("--tag") + 1]
+        self.assertEqual(base, "registry.example/team/base:custom")
+        self.assertIn("VERSION=custom", base_call)
+        self.log.unlink()
+        _, calls = self.run_make("docker-build-racer-streaming", *args)
+        runtime_call = self.build_call(calls)
+        self.assertIn("KAITO_BASE_IMAGE=" + base, runtime_call)
+        self.assertNotIn("./docker/presets/models/tfs/Dockerfile", runtime_call)
+        self.assertFalse(any(c[0] == "push" for c in calls))
 
     def test_existing_workspace_command_unchanged(self):
         _, calls = self.run_make("docker-build-workspace", "ARCH=amd64")
@@ -120,10 +135,12 @@ class RacerBuildTargets(unittest.TestCase):
             ("ARCH=arm64",),
             ("PLATFORMS=linux/arm64",),
             ("PLATFORMS=linux/amd64,linux/arm64",),
-            ("KAITO_STREAMING_BASE_IMAGE=",),
+            ("REGISTRY=",),
+            ("KAITO_BASE_IMG_NAME=",),
+            ("KAITO_BASE_IMG_TAG=",),
             ("RACER_STREAMING_IMAGE=",),
         ]
-        for target in ("docker-build-kaito-streaming-base", "docker-build-racer-streaming"):
+        for target in ("docker-build-racer-streaming",):
             for args in cases:
                 with self.subTest(target=target, args=args):
                     _, calls = self.run_make(target, "-j4", *args, ok=False)
@@ -132,9 +149,8 @@ class RacerBuildTargets(unittest.TestCase):
     def test_output_must_be_tag_and_runtime_must_not_replace_base(self):
         digest = "example.invalid/image@sha256:" + "b" * 64
         for target, args in [
-            ("docker-build-kaito-streaming-base", ["KAITO_STREAMING_BASE_IMAGE=" + digest]),
             ("docker-build-racer-streaming", ["RACER_STREAMING_IMAGE=" + digest]),
-            ("docker-build-racer-streaming", ["KAITO_STREAMING_BASE_IMAGE=example.invalid/base:1",
+            ("docker-build-racer-streaming", ["REGISTRY=example.invalid", "KAITO_BASE_IMG_NAME=base", "KAITO_BASE_IMG_TAG=1",
                                              "RACER_STREAMING_IMAGE=example.invalid/base:1"]),
         ]:
             with self.subTest(target=target, args=args):
@@ -145,7 +161,7 @@ class RacerBuildTargets(unittest.TestCase):
         result, calls = self.run_make("docker-build-racer-streaming", "-n")
         self.assertEqual(calls, [])
         self.assertIn("docker buildx build", result.stdout)
-        self.assertIn("KAITO_STREAMING_BASE_IMAGE=", result.stdout)
+        self.assertIn("KAITO_BASE_IMAGE=", result.stdout)
 
 
 if __name__ == "__main__":
