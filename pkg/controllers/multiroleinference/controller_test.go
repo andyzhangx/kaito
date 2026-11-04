@@ -21,11 +21,14 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	kaitov1alpha1 "github.com/kaito-project/kaito/api/v1alpha1"
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	inferencesetutil "github.com/kaito-project/kaito/pkg/utils/inferenceset"
 )
 
 func TestReconcileInferenceSetPropagatesAnnotations(t *testing.T) {
@@ -108,4 +111,72 @@ func TestReconcileInferenceSetClearsAnnotationsWhenMRIAnnotationsRemoved(t *test
 	got := &kaitov1beta1.InferenceSet{}
 	require.NoError(t, cl.Get(context.Background(), client.ObjectKey{Name: "mri-test-prefill", Namespace: "default"}, got))
 	assert.Nil(t, got.Spec.Template.Annotations)
+}
+
+// Exercise the manual handoff used by the lab POC, not HPA behavior or API-server defaulting.
+func TestReconcileInferenceSetExternalReplicaOwnership(t *testing.T) {
+	ctx := context.Background()
+	for _, roleType := range []kaitov1alpha1.MultiRoleInferenceRoleType{
+		kaitov1alpha1.MultiRoleInferenceRolePrefill, kaitov1alpha1.MultiRoleInferenceRoleDecode,
+	} {
+		t.Run(string(roleType), func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, kaitov1alpha1.AddToScheme(scheme))
+			require.NoError(t, kaitov1beta1.AddToScheme(scheme))
+			mri := &kaitov1alpha1.MultiRoleInference{
+				ObjectMeta: metav1.ObjectMeta{Name: "external-replicas", Namespace: "default", UID: types.UID("mri-uid")},
+				Spec: kaitov1alpha1.MultiRoleInferenceSpec{
+					Model:         kaitov1alpha1.MultiRoleInferenceModelSpec{Name: "microsoft/Phi-4-mini-instruct"},
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "poc"}},
+				},
+			}
+			role := kaitov1alpha1.MultiRoleInferenceRoleSpec{Type: roleType, Replicas: ptr.To[int32](1), InstanceType: "Standard_NC24ads_A100_v4"}
+			c := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &MultiRoleInferenceReconciler{Client: c, Scheme: scheme}
+			require.NoError(t, r.reconcileInferenceSet(ctx, mri, role))
+			key := types.NamespacedName{Name: mri.Name + "-" + string(roleType), Namespace: mri.Namespace}
+			child := &kaitov1beta1.InferenceSet{}
+			require.NoError(t, c.Get(ctx, key, child))
+			require.Equal(t, int32(1), *child.Spec.Replicas)
+
+			// Operator removes the parent count, then a separate writer scales the existing child.
+			role.Replicas = nil
+			child.Spec.Replicas = ptr.To[int32](3)
+			require.NoError(t, c.Update(ctx, child))
+			originalTemplate := child.Spec.Template.DeepCopy()
+			originalHash := inferencesetutil.ComputeInferenceSetHash(child)
+			annotations := map[string]string{
+				"scaledobject.kaito.sh/auto-provision": "false",
+				"scaledobject.kaito.sh/min-replicas":   "1",
+				"scaledobject.kaito.sh/max-replicas":   "3",
+				"scaledobject.kaito.sh/metrics":        "- name: vllm:num_requests_waiting\n  type: gauge\n  source: modelpod\n  upthreshold: 2\n  downthreshold: 1\n",
+				"example.com/operator-note":            "preserve",
+			}
+			child.Annotations = annotations
+			child.Labels["example.com/operator-label"] = "preserve"
+			require.NoError(t, c.Update(ctx, child))
+
+			for i := 0; i < 3; i++ {
+				// A fresh reconciler has no memory of the bootstrap or external scale write.
+				r = &MultiRoleInferenceReconciler{Client: c, Scheme: scheme}
+				require.NoError(t, r.reconcileInferenceSet(ctx, mri, role))
+				require.NoError(t, c.Get(ctx, key, child))
+				assert.Equal(t, int32(3), *child.Spec.Replicas)
+				assert.Equal(t, annotations, child.Annotations)
+				assert.Equal(t, "preserve", child.Labels["example.com/operator-label"])
+				assert.Equal(t, *originalTemplate, child.Spec.Template)
+				assert.Equal(t, originalHash, inferencesetutil.ComputeInferenceSetHash(child))
+				require.Len(t, child.OwnerReferences, 1)
+				assert.Equal(t, mri.UID, child.OwnerReferences[0].UID)
+			}
+
+			// Once the external writer is stopped, explicit fixed counts still reconcile.
+			role.Replicas = ptr.To[int32](2)
+			require.NoError(t, r.reconcileInferenceSet(ctx, mri, role))
+			require.NoError(t, c.Get(ctx, key, child))
+			assert.Equal(t, int32(2), *child.Spec.Replicas)
+			assert.Equal(t, annotations, child.Annotations)
+			assert.Equal(t, *originalTemplate, child.Spec.Template)
+		})
+	}
 }
