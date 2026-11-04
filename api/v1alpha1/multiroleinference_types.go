@@ -51,8 +51,9 @@ type MultiRoleInferenceRoleSpec struct {
 
 	// Replicas is the number of workspaces (InferenceSet replicas) for this role.
 	// Each replica maps to one Workspace → one StatefulSet.
-	// When nil, the controller does not reconcile the replica count, allowing
-	// external autoscalers (e.g., HPA) to manage scaling independently.
+	// When nil, new child InferenceSets start at one replica and the controller
+	// does not reconcile existing child replica counts, allowing external
+	// autoscalers (e.g., HPA) to manage scaling independently.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`

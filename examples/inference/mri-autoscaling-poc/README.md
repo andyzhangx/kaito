@@ -1,35 +1,34 @@
 # MRI manual scale-up POC: KAITO-side preparation only
 
-This is a **disposable-cluster experiment**, not supported production autoscaling or the managed-mode proposal. It implements the KAITO installation adjustment from [section 0 of the POC plan](https://github.com/andyzhangx/demo/blob/d2828050ea9657eda90aa9157cbdb949d9b552e8/llm/kaito/mri-pd-autoscaling-poc-implementation-plan.md). It does **not** implement the required scaler changes or prove GPU serving, routing, HPA behavior, or safe downscale.
+This is a **disposable-cluster experiment**, not supported production autoscaling or the managed-mode proposal. It implements the KAITO replica-defaulting and bootstrap changes for [section 0 of the POC plan](https://github.com/andyzhangx/demo/blob/d2828050ea9657eda90aa9157cbdb949d9b552e8/llm/kaito/mri-pd-autoscaling-poc-implementation-plan.md). It does **not** implement the required scaler changes or prove GPU serving, routing, HPA behavior, or safe downscale.
 
-## Why a lab-only post-renderer?
+## Runtime behavior and compatibility
 
-The MRI controller already preserves an existing child InferenceSet's replica count when the corresponding parent role's `replicas` is absent. However, the stock Helm CRD defaults that field to one, unlike the base CRD. Removing the default globally would change existing fixed-workload behavior.
+The MRI API `SetDefaults` and Helm CRD now preserve omitted role `replicas`, matching the existing base CRD/API contract. The MRI controller initializes a **new** child InferenceSet to one replica when its parent count is absent; for an **existing** child it leaves the count untouched. Explicit positive parent counts still reconcile the child to that fixed value. Child bootstrap never writes a default back to the parent.
 
-`post-render.py` removes **only** that default from every version of the rendered MRI CRD. Other resources, validation, and defaults are unchanged. The stock chart and Go `SetDefaults` behavior remain unchanged. The registered MRI webhook is validating-only: the current Knative admission path does not call `SetDefaults` or emit mutation patches. Local tests cover that registration, not any additional admission components in your cluster. If a future deployment invokes `SetDefaults` or restores replicas, stop; this overlay alone is no longer sufficient.
+This changes omitted-count semantics: omission is no longer a durable fixed count of one. It means bootstrap at one and then permit an external writer to own that child's count. It does not start or authorize an autoscaler. If you want a fixed workload, specify a positive count explicitly for every role. An existing MRI whose counts were previously defaulted and stored as one stays fixed at one after upgrade; nothing automatically clears its counts or transfers ownership. Remove counts only through the verified handoff below.
 
-**A CRD is cluster-scoped.** This opt-in is a dedicated installation, not a per-MRI API feature. Use an isolated cluster with no unrelated MRI workloads. Every fixed role in that installation must explicitly specify positive replicas. Never blanket-patch a shared/production CRD. There is no new parent policy annotation.
+The old POC post-renderer is retired: **no overlay or new policy annotation is required**. The chart and base CRD replica schemas agree, retain `minimum: 1`, and make replicas optional. The registered MRI webhook remains validating-only; tests also exercise `SetDefaults` directly and Kubernetes structural schema defaulting to guard both paths. These local tests do not prove every additional admission/conversion component in a real cluster leaves nil intact.
 
 ## 1. Render and inspect; install only in the dedicated lab
 
-Prerequisites: Helm with post-renderer support, Python 3 and PyYAML available to the executable. From the repository root:
+From the repository root:
 
 ```sh
 helm template mri-poc charts/kaito/workspace \
   --set featureGates.enableInferenceSetController=true \
   --set featureGates.enableMultiRoleInferenceController=true \
-  --post-renderer ./examples/inference/mri-autoscaling-poc/post-render.py \
   > /tmp/mri-poc-rendered.yaml
-python3 -m unittest discover -s examples/inference/mri-autoscaling-poc -p 'test_*.py' -v
+go test ./api/v1alpha1 ./pkg/controllers/multiroleinference ./pkg/workspace/webhooks
 ```
 
-Inspect the output and use the **same post-renderer on every Helm install/upgrade** with your normal lab values. Pin the chart commit, controller/scaler/KEDA/vLLM/sidecar images and configuration; the render command alone does not pin runtime images or constitute deployment. The renderer fails if there is no single MRI CRD or its replica schema unexpectedly changes. It does not access a cluster.
+Inspect the output and use the pinned chart/controller build with your normal lab values. Pin the chart commit, controller/scaler/KEDA/vLLM/sidecar images and configuration; the render command alone does not pin runtime images or constitute deployment. The CRD change is **cluster-scoped**, not a per-MRI opt-in. Test this branch in an isolated cluster, not a shared/production installation. Review omission semantics before any broader upgrade.
 
-After installation, inspect `kubectl get crd multiroleinferences.kaito.sh -o yaml`: every served role replica schema must lack `default`, remain optional, and retain `minimum: 1`. Inspect all installed mutating/conversion webhooks. A literal YAML `null` does not bypass API-server defaulting. Do not proceed if readback reinserts a value. A later stock-chart upgrade would restore the default and can reintroduce competing writers.
+After installation, inspect `kubectl get crd multiroleinferences.kaito.sh -o yaml`: every served role replica schema must lack `default`, remain optional, and retain `minimum: 1`. Inspect all installed mutating/conversion webhooks. Do not proceed if readback reinserts a value. Rolling back to an older chart that restores the default can reintroduce competing writers; first complete the fixed-ownership handoff below.
 
 ## 2. Bootstrap positive fixed roles with autoscaling disabled
 
-Use [the Phi-4 example](../kaito_multiroleinference_phi4_4.yaml), adapted for your lab, with **both roles explicitly set to `replicas: 1`** (or another safe positive count). Keep topology/GPU/TP fixed and suitable spare capacity available. Do not create a new nil-replica child and expect an HPA to rescue zero replicas.
+Use [the Phi-4 example](../kaito_multiroleinference_phi4_4.yaml), adapted for your lab, with **both roles explicitly set to `replicas: 1`** (or another safe positive count). Keep topology/GPU/TP fixed and suitable spare capacity available. The controller also supports initially omitted parent counts by creating children at one; this runbook deliberately starts with explicit counts so ownership transfer is an observable operator step. Never rely on an HPA to rescue an existing zero/nil child.
 
 Record the MRI namespace/name/UID, exact prefill/decode role membership, and both child names/UIDs/controller-owner references in the lab allowlist. Wait for child InferenceSets, Workspaces, engine pods, and a working P/D route. Pod readiness alone is insufficient: confirm successful routed inference and KV transfer. Keep the scaler disabled and verify no SO/HPA or other controller currently targets either child.
 
@@ -67,7 +66,7 @@ metadata:
 
 For decode use `vllm:num_requests_running`, with independently calibrated thresholds. These are parser examples, not recommended capacity targets. Require `0 <= downthreshold < upthreshold`, positive bounds, and max no lower than the live count. Both parser thresholds are required; they do not authorize downscale.
 
-Check preservation across MRI reconciles/restarts. Save and compare `spec.template`, the InferenceSet spec hash, Workspace templates and model pod identities before/after **annotation-only** changes; there must be no rollout. The controller unit test covers metadata/template/spec-hash preservation and a newly constructed reconciler, not a real process restart or downstream rollout.
+Check preservation across MRI reconciles/restarts. Save and compare `spec.template`, the InferenceSet spec hash, Workspace templates and model pod identities before/after **annotation-only** changes; there must be no rollout. The controller unit tests cover positive creation bootstrap, no reinitialization of existing children (including nil/zero counts), metadata/template/spec-hash preservation and newly constructed reconcilers, not a real process restart or downstream rollout. Existing nil/zero children are not automatically repaired: resolve those states with autoscaling disabled before entering this positive-only experiment.
 
 ## 5. Stop here until the separate scaler implementation is ready
 
@@ -86,4 +85,4 @@ Follow the linked plan's full acceptance checklist before claiming a working aut
 
 Block new activation/recreation in the lab scaler authorization gate first. Identify the exact demo-owned SO/HPA UIDs and target references, disable auto-provision, and stop the external writer. Delete only verified demo-owned objects using your approved lab procedure; **verify both SO and HPA absence** and that neither is recreated. KEDA unavailability or uncertain ownership means handoff is blocked, not successful. Do not adopt/delete foreign objects.
 
-Only after external writers are conclusively gone, set each parent role to its **current positive child count** and verify fixed reconciliation resumes without an unintended decrease. Do not restore the stock chart default until every role has explicit fixed counts and the handoff is complete. Manual capacity reduction, if desired, requires a separate workload-safe procedure; this POC has no drain/downscale protocol.
+Only after external writers are conclusively gone, set each parent role to its **current positive child count** and verify fixed reconciliation resumes without an unintended decrease. Do not roll back to an older chart/defaulting implementation until every role has explicit fixed counts and the handoff is complete. Manual capacity reduction, if desired, requires a separate workload-safe procedure; this POC has no drain/downscale protocol.

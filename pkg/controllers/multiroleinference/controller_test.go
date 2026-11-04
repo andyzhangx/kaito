@@ -180,3 +180,48 @@ func TestReconcileInferenceSetExternalReplicaOwnership(t *testing.T) {
 		})
 	}
 }
+
+func TestReconcileInferenceSetReplicaBootstrap(t *testing.T) {
+	ctx := context.Background()
+	for _, roleType := range []kaitov1alpha1.MultiRoleInferenceRoleType{
+		kaitov1alpha1.MultiRoleInferenceRolePrefill, kaitov1alpha1.MultiRoleInferenceRoleDecode,
+	} {
+		for _, tt := range []struct {
+			name                string
+			existing            bool
+			parent, child, want *int32
+		}{
+			{name: "new omitted parent bootstraps one", want: ptr.To[int32](1)},
+			{name: "new explicit parent", parent: ptr.To[int32](2), want: ptr.To[int32](2)},
+			{name: "existing external count", existing: true, child: ptr.To[int32](4), want: ptr.To[int32](4)},
+			{name: "existing zero is not reinitialized", existing: true, child: ptr.To[int32](0), want: ptr.To[int32](0)},
+			{name: "existing nil is not reinitialized", existing: true},
+			{name: "existing explicit parent remains authoritative", existing: true, parent: ptr.To[int32](2), child: ptr.To[int32](4), want: ptr.To[int32](2)},
+		} {
+			t.Run(string(roleType)+"/"+tt.name, func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				require.NoError(t, kaitov1alpha1.AddToScheme(scheme))
+				require.NoError(t, kaitov1beta1.AddToScheme(scheme))
+				mri := &kaitov1alpha1.MultiRoleInference{ObjectMeta: metav1.ObjectMeta{Name: "bootstrap", Namespace: "default", UID: types.UID("bootstrap-uid")}}
+				role := kaitov1alpha1.MultiRoleInferenceRoleSpec{Type: roleType, Replicas: tt.parent}
+				key := client.ObjectKey{Name: mri.Name + "-" + string(roleType), Namespace: mri.Namespace}
+				builder := fake.NewClientBuilder().WithScheme(scheme)
+				if tt.existing {
+					builder.WithObjects(&kaitov1beta1.InferenceSet{
+						ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+						Spec:       kaitov1beta1.InferenceSetSpec{Replicas: tt.child},
+					})
+				}
+				c := builder.Build()
+				for i := 0; i < 3; i++ {
+					r := &MultiRoleInferenceReconciler{Client: c, Scheme: scheme}
+					require.NoError(t, r.reconcileInferenceSet(ctx, mri, role))
+					child := &kaitov1beta1.InferenceSet{}
+					require.NoError(t, c.Get(ctx, key, child))
+					assert.Equal(t, tt.want, child.Spec.Replicas)
+					assert.Equal(t, tt.parent, role.Replicas, "bootstrap must not write parent replicas")
+				}
+			})
+		}
+	}
+}

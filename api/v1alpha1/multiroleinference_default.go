@@ -17,15 +17,7 @@ import (
 	"context"
 )
 
-// SetDefaults for the MultiRoleInference.
-func (m *MultiRoleInference) SetDefaults(_ context.Context) {
-	// Default replicas to 1 for each role if not set.
-	// When replicas is nil, autoscaling is assumed and the controller
-	// will not reconcile the replica count.
-	for i := range m.Spec.Roles {
-		if m.Spec.Roles[i].Replicas == nil {
-			one := int32(1)
-			m.Spec.Roles[i].Replicas = &one
-		}
-	}
-}
+// SetDefaults preserves omitted role replicas so the MRI controller can leave
+// existing child replica counts under external control. Child creation supplies
+// the initial positive count; explicit parent counts remain authoritative.
+func (m *MultiRoleInference) SetDefaults(_ context.Context) {}

@@ -40,45 +40,31 @@ func TestMultiRoleInference_SupportedVerbs(t *testing.T) {
 }
 
 func TestMultiRoleInference_SetDefaults(t *testing.T) {
-	two := int32(2)
-	three := int32(3)
-	tests := []struct {
-		name             string
-		mri              *MultiRoleInference
-		expectedReplicas []int32
+	two, three := int32(2), int32(3)
+	for _, tt := range []struct {
+		name            string
+		prefill, decode *int32
 	}{
-		{
-			name: "replicas should default to 1 when nil",
-			mri: &MultiRoleInference{
-				Spec: MultiRoleInferenceSpec{
-					Roles: []MultiRoleInferenceRoleSpec{
-						{Type: MultiRoleInferenceRolePrefill, Replicas: nil, InstanceType: "Standard_NC24ads_A100_v4"},
-						{Type: MultiRoleInferenceRoleDecode, Replicas: nil, InstanceType: "Standard_NC24ads_A100_v4"},
-					},
-				},
-			},
-			expectedReplicas: []int32{1, 1},
-		},
-		{
-			name: "replicas should not change when already set",
-			mri: &MultiRoleInference{
-				Spec: MultiRoleInferenceSpec{
-					Roles: []MultiRoleInferenceRoleSpec{
-						{Type: MultiRoleInferenceRolePrefill, Replicas: &two, InstanceType: "Standard_NC24ads_A100_v4"},
-						{Type: MultiRoleInferenceRoleDecode, Replicas: &three, InstanceType: "Standard_NC24ads_A100_v4"},
-					},
-				},
-			},
-			expectedReplicas: []int32{2, 3},
-		},
-	}
-
-	for _, tt := range tests {
+		{name: "omitted replicas stay nil"},
+		{name: "explicit counts unchanged", prefill: &two, decode: &three},
+		{name: "mixed fixed and external ownership", decode: &three},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tt.mri.SetDefaults(context.Background())
-			for i, expected := range tt.expectedReplicas {
-				assert.Equal(t, expected, *tt.mri.Spec.Roles[i].Replicas)
+			mri := &MultiRoleInference{
+				ObjectMeta: metav1.ObjectMeta{Name: "defaults", Annotations: map[string]string{"example.com/note": "preserve"}},
+				Spec: MultiRoleInferenceSpec{
+					Model:         MultiRoleInferenceModelSpec{Name: "microsoft/Phi-4-mini-instruct"},
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "defaults"}},
+					Roles: []MultiRoleInferenceRoleSpec{
+						{Type: MultiRoleInferenceRolePrefill, Replicas: tt.prefill, InstanceType: "Standard_NC24ads_A100_v4"},
+						{Type: MultiRoleInferenceRoleDecode, Replicas: tt.decode, InstanceType: "Standard_NC24ads_A100_v4"},
+					},
+				},
 			}
+			before := mri.DeepCopy()
+			mri.SetDefaults(context.Background())
+			mri.SetDefaults(context.Background())
+			assert.Equal(t, before, mri, "defaulting must preserve replica ownership and other fields")
 		})
 	}
 }

@@ -430,10 +430,14 @@ func (r *MultiRoleInferenceReconciler) reconcileInferenceSet(
 		desired.Labels[kaitov1alpha1.LabelMultiRoleInferenceParent] = mri.Name
 		desired.Labels[kaitov1alpha1.LabelInferenceRole] = roleStr
 
-		// Spec — only reconcile replicas when explicitly set (non-nil).
-		// When nil, autoscaling is assumed and the controller skips replica reconciliation.
+		// Explicit parent counts remain authoritative. Otherwise bootstrap only a
+		// new child, matching the InferenceSet CRD default, and leave existing
+		// children untouched so an external writer can own their replica count.
 		if role.Replicas != nil {
 			desired.Spec.Replicas = role.Replicas
+		} else if desired.ResourceVersion == "" {
+			one := int32(1)
+			desired.Spec.Replicas = &one
 		}
 
 		// LabelSelector — start from the MRI's labelSelector and inject role info.
