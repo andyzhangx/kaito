@@ -23,6 +23,7 @@ metadata:
   namespace: kaito-poc
   annotations:
     kaito.sh/model-cache: racer
+    kaito.sh/runtime: vllm
     kaito.sh/streaming-service-account: model-reader
 resource:
   instanceType: Standard_NC24ads_A100_v4
@@ -32,4 +33,3 @@ resource:
 inference:
   preset:
     name: microsoft/Phi-4-mini-instruct
-    runtime: vllm

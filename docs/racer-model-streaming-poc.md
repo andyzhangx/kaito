@@ -438,3 +438,31 @@ CGO 需要 C 编译器与 glibc 开发工具。本地 ABI 测试调用真正编�
 ### Makefile 构建入口补充验证
 
 Racer 构建已统一复用现有 `docker-build-kaito-base` 配置；GNU Make 4.4.1 的 8 项构建命令回归测试通过，覆盖共享 name/tag、默认值、覆盖配置、平台校验和并行执行时的失败前置校验。Docker 被 mock；没有实际构建或推送镜像。Python ruff、文档 shell 语法/链接及 diff 格式检查通过。
+
+### 2026-11-25 本地复验（不替代上述历史结果）
+
+本轮修正了 Workspace 示例：将不在 CRD 中的 `inference.preset.runtime`
+改为 `metadata.annotations["kaito.sh/runtime"]: vllm`。
+新增 `TestRacerWorkspaceExampleSchema`，直接加载示例及 `config/`、Helm chart
+两份 Workspace CRD，检查所用 API version 已 served、runtime annotation 正确，
+并用 Kubernetes structural-schema pruning 检查未知字段；同时断言旧的
+`inference.preset.runtime` 会被检测出来。此测试只覆盖离线字段检查，
+**不是完整 schema/CEL/webhook 校验，更不是实际集群 admission 或 GPU 推理验证**。
+未新增依赖或修改 CRD。
+
+本轮使用本机已有 Go 1.26.10，`GOTOOLCHAIN=local GOPROXY=off`，
+日志保存在执行主机 `/tmp/kaito-racer-validation-20261125/`（不随仓库分发）。
+本机 `PATH` 没有 `make`，但找到了已有 GNU Make 4.4.1：
+`/home/vibe/.openclaw/workspace/artifacts/kaito2431-validation-tools/make`。
+未安装系统工具、容器 daemon，也未访问集群或凭据。
+
+- `CGO_ENABLED=0 go test -p 2 ./pkg/workspace/inference/... ./cmd/workspace`：4 个推理包通过，workspace cmd 编译通过但无测试文件，见 `controller-tests.log`。
+- `CGO_ENABLED=0 go test -count=1 -v ./pkg/workspace/inference/modelstreaming -run TestRacerWorkspaceExampleSchema`：两份 CRD 的回归检查均通过，见 `example-schema-regression.log`。
+- `CGO_ENABLED=0 go build -p 2 -o /tmp/kaito-racer-validation-20261125/workspace ./cmd/workspace`：实际 controller 二进制编译通过，见 `controller-binary-build.log`；不是镜像构建。
+- 在 `tools/racer-cache-provider` 执行 `CGO_ENABLED=0 go test -v ./...`：通过；这是 HTTP/provider 单测，**不覆盖 cgo C ABI 或真实 Racer**。
+- `MAKE=<上述已有 make 路径> python3 hack/test-racer-build-targets.py`：8 项通过；这些测试使用 **Docker mock**，不是镜像构建成功。
+- `helm lint charts/kaito/workspace`、新增 Go 文件的 gofmt/gci 和 `git diff --check`：通过。
+- Provider `CGO_ENABLED=0 go vet ./...`：通过；controller `CGO_ENABLED=0 go vet -p 2 ./pkg/workspace/inference/... ./cmd/workspace` 在 180 秒时限内未完成，被终止，没有标记为通过（`controller-vet.log`）。
+- 实际尝试文档中的 `docker-build-racer-streaming` 和 `docker-build-workspace` make target（`REGISTRY=andyzhangx OUTPUT_TYPE=type=docker VERSION=0.13.0-racer`，runtime target 另设 `KAITO_BASE_IMG_NAME=kaito-base KAITO_BASE_IMG_TAG=0.13.0-racer RACER_STREAMING_IMAGE=andyzhangx/kaito-vllm-racer:0.13.0-racer ARCH=amd64 PLATFORMS=linux/amd64`）：**均失败，Docker 不存在**。还确认 `podman`、`buildctl`、`nerdctl`、`buildah`、`kaniko` 不在 `PATH`；没有产生镜像，更没有 push。完整命令/错误见 `runtime-image-build-with-existing-make.log` 和 `controller-image-build.log`。
+- Provider `CGO_ENABLED=1 go test -race ./...`、`CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/kaito-racer-validation-20261125/libkaito_racer_cache.so .`，以及 controller `CGO_ENABLED=1 go test -race -p 2 ./pkg/workspace/inference/modelstreaming`：**均失败，`gcc` 不存在**；不把禁用 cgo 的测试等同于 C ABI/race 验证。
+- 本轮未运行 RACER/GPU e2e：本任务没有授权访问 POC 集群、Racer 服务及 origin 配置；本机也没有 `nvidia-smi`，且上述镜像构建尚未完成。仍须在获准的真实环境完成第 8 节验收矩阵，不能用 mock 结果替代。
