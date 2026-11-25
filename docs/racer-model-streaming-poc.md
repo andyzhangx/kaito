@@ -177,7 +177,7 @@ ClusterCache 是 cluster-scoped，没有 workload namespace。创建它后 opera
 
 ## 第三步：构建并推送 KAITO 控制器和 runtime
 
-**不需要新建专用 base 镜像。** 复用已有、可拉取的兼容 KAITO vLLM runtime（保留 Ray/vLLM 环境，包含 `runai-model-streamer` 和 `runai-model-streamer-azure` **均为 0.16.0**）；填写实际固定 tag/digest。这里只构建控制器和加入 provider 的派生 runtime。Dockerfile 会检查 ABI；本次未验证任何现有镜像 tag 的兼容性。
+**不需要新建专用 base 镜像。** 复用已有、可拉取的兼容 KAITO vLLM runtime（保留 Ray/vLLM 环境，包含 `runai-model-streamer` 和 `runai-model-streamer-azure` **均为 0.16.0**）。下例使用与本分支 `base_images.yaml` 一致、已在 MCR 发布的 `0.6.3`。这里只构建控制器和加入 provider 的派生 runtime。Dockerfile 会检查 ABI；已确认该 tag 存在，但尚未实际构建验证其兼容性。
 
 ```bash
 git clone --branch poc/racer-model-streaming https://github.com/andyzhangx/kaito.git
@@ -185,7 +185,7 @@ cd kaito
 export REGISTRY=YOUR_REGISTRY
 export OUTPUT_TYPE=type=docker ARCH=amd64 PLATFORMS=linux/amd64
 export VERSION=0.13.0-racer
-export EXISTING_RUNTIME_BASE=YOUR_EXISTING_COMPATIBLE_IMAGE_REFERENCE
+export EXISTING_RUNTIME_BASE=mcr.microsoft.com/aks/kaito/kaito-base:0.6.3
 export RACER_STREAMING_IMAGE="$REGISTRY/kaito-vllm-racer:$VERSION"
 make docker-build-workspace ARCH=amd64
 docker buildx build --platform linux/amd64 --load \
