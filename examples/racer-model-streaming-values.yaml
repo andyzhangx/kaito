@@ -6,7 +6,7 @@ featureGates:
 # Keep existing defaultModelMirrorStorageClass/defaultStreamingServiceAccount
 # and Workload Identity settings, or set them according to the streaming guide.
 racerCacheBindings:
-  - namespace: kaito-poc
+  - namespace: kaito-workspace
     account: YOUR_ACTUAL_STORAGE_ACCOUNT
     container: YOUR_ACTUAL_MIRROR_CONTAINER
     cacheName: kaito-model-cache

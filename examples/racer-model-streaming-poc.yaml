@@ -4,7 +4,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: kaito-poc
+  name: kaito-workspace
 ---
 # This inference identity is separate from Racer's Azure origin identity.
 # Configure its federated identity credential before creating the Workspace.
@@ -12,7 +12,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: model-reader
-  namespace: kaito-poc
+  namespace: kaito-workspace
   annotations:
     azure.workload.identity/client-id: APP_MANAGED_IDENTITY_CLIENT_ID
 ---
@@ -20,7 +20,7 @@ apiVersion: kaito.sh/v1beta1
 kind: Workspace
 metadata:
   name: racer-model
-  namespace: kaito-poc
+  namespace: kaito-workspace
   annotations:
     kaito.sh/model-cache: racer
     kaito.sh/runtime: vllm
