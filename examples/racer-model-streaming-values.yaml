@@ -10,7 +10,8 @@ racerCacheBindings:
     account: YOUR_ACTUAL_STORAGE_ACCOUNT
     container: YOUR_ACTUAL_MIRROR_CONTAINER
     cacheName: kaito-model-cache
-    objectImage: YOUR_ACTUAL_RACER_OBJECT_IMAGE@sha256:YOUR_DIGEST
+    # Azure/unbounded v0.27.0 multi-platform manifest; keep server at this version.
+    objectImage: ghcr.io/azure/racer-object@sha256:5c43d6c4dd2a18998568be84252040f88f6be7b93ec2e55fdf0ddeb8a92663ba
     runtimeImage: YOUR_REGISTRY/kaito/vllm-racer@sha256:YOUR_DIGEST
     # Administrative contract: never overwrite blobs at an existing key.
     immutable: true

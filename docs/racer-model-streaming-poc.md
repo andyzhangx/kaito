@@ -13,42 +13,72 @@
 
 ```bash
 kubectl create namespace kaito-workspace --dry-run=client -o yaml | kubectl apply -f -
-kubectl get modelmirrors -A
-kubectl -n kaito-workspace get pvc
-export MIRROR_PVC=YOUR_COMPLETED_MODEL_MIRROR_PVC
-PV=$(kubectl -n kaito-workspace get pvc "$MIRROR_PVC" -o jsonpath='{.spec.volumeName}')
-kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeAttributes}'; echo
-export ACCOUNT=YOUR_ACTUAL_STORAGE_ACCOUNT
-export CONTAINER=YOUR_ACTUAL_MIRROR_CONTAINER
+kubectl -n kaito-workspace get modelmirrors \
+  -o custom-columns='NAME:.metadata.name,MODE:.spec.mode,MODEL:.spec.source.modelID,PHASE:.status.phase'
+export MIRROR_NAME=YOUR_READY_MANAGED_MODEL_MIRROR
+# 同名 PVC → 已绑定 PV；仅解析本分支使用的 Managed Blob CSI 路径。
+# Python 只打印 account/container，不输出可能包含 secret 引用的完整 volumeHandle。
+if ! STORAGE_NAMES=$(python3 - <<'PY_STORAGE'
+import json, os, re, subprocess
+
+def get(*args):
+    return json.loads(subprocess.check_output(['kubectl', *args, '-o', 'json']))
+
+name = os.environ['MIRROR_NAME']
+mirror = get('-n', 'kaito-workspace', 'get', 'modelmirror', name)
+assert mirror['spec'].get('mode', 'Managed') == 'Managed', '需要 Managed mirror'
+assert mirror['status'].get('phase') == 'Ready', '先等待 mirror Ready'
+pvc = get('-n', 'kaito-workspace', 'get', 'pvc', name)
+assert pvc['status'].get('phase') == 'Bound', 'PVC 尚未 Bound'
+pv_name = pvc['spec'].get('volumeName')
+assert pv_name, 'PVC 未关联 PV'
+csi = get('get', 'pv', pv_name)['spec'].get('csi', {})
+assert csi.get('driver') == 'blob.csi.azure.com', '需要 Azure Blob CSI'
+parts = csi.get('volumeHandle', '').split('#')
+assert len(parts) >= 3, '与本分支支持的 volumeHandle 格式不符'
+account, container = parts[1:3]
+assert re.fullmatch(r'[a-z0-9]{3,24}', account), 'account 缺失或无效'
+assert re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', container) and '--' not in container, 'container 缺失或无效'
+print(account, container)
+PY_STORAGE
+); then
+  echo '无法解析存储位置；停止，不要继续部署 Racer。' >&2
+  exit 1
+fi
+read -r ACCOUNT CONTAINER <<< "$STORAGE_NAMES"
+export ACCOUNT CONTAINER
 export CACHE_NAME=kaito-model-cache
+printf 'Racer origin: https://%s.blob.core.windows.net/%s\n' "$ACCOUNT" "$CONTAINER"
 ```
 
-从该模型的 PV 属性/实际 Azure 资源确认 account/container；不能用模型名、PVC 名或 StorageClass 名猜测。后续 origin 和 KAITO binding 必须使用同一组值。**不要覆盖已缓存的 blob key**：用新容器或 revision 前缀发布新版本；本 provider ABI 不携带 ETag，不能保证覆盖写失效。
+`ACCOUNT`/`CONTAINER` **不是要求新建存储资源**：默认 StorageClass 可动态创建它们；这里把已下载模型的存储位置传给 Racer origin 和 KAITO binding。先按上表的 `MODEL` 选择与基线 Workspace 相同、Ready 的 Managed ModelMirror；尚无 mirror 时先完成普通 streaming（不加 Racer annotation）。解析方式与本分支 [WI Blob provider](../pkg/workspace/inference/modelstreaming/azure/wiblob.go) 一致，不适用于任意 CSI driver/Static mirror，也不能仅靠 `volumeAttributes` 或从 PVC/模型名猜测。后续 values 中的 account/container 填这里打印的实际值。**不要覆盖已缓存的 blob key**：用新容器或 revision 前缀发布新版本；本 provider ABI 不携带 ETag，不能保证覆盖写失效。
 
 ## 第二步：安装 Racer，并使用 GPU 节点专用 NVMe
 
-固定 **Azure/unbounded v0.18.0**。以下依据该 tag 的 [Azure Blob 安装指南](https://github.com/Azure/unbounded/blob/v0.18.0/docs/content/guides/azure-blob-cache.md)、[Racer 节点/磁盘说明](https://github.com/Azure/unbounded/blob/v0.18.0/docs/content/reference/racer.md) 和 [workload overrides](https://github.com/Azure/unbounded/blob/v0.18.0/docs/content/reference/workload-overrides.md)。无需猜测 Helm chart，也不要使用这个版本不存在的 `manage blobs install` 命令。
+固定 **Azure/unbounded v0.27.0**（commit `75d423e09cef984d02cbd7f7d80b0c9eb5150695`），不是追踪 latest。以下依据该 tag 的 [Azure Blob 安装指南](https://github.com/Azure/unbounded/blob/v0.27.0/docs/content/guides/azure-blob-cache.md)、[Racer 节点/磁盘说明](https://github.com/Azure/unbounded/blob/v0.27.0/docs/content/reference/racer.md) 和 [workload overrides](https://github.com/Azure/unbounded/blob/v0.27.0/docs/content/reference/workload-overrides.md)。无需猜测 Helm chart，也不要使用这个版本不存在的 `manage blobs install` 命令。
+
+**已有旧版安装不要直接重跑安装命令。** v0.27.0 将 control/origin 合并到 `daemonset/racer`（容器仍叫 `dataplane`），不再部署独立 `racer-controller` 或每 cache 的 origin DaemonSet。升级前按 [官方迁移说明](https://github.com/Azure/unbounded/blob/v0.27.0/docs/content/reference/racer.md#upgrading-from-per-cache-origin-daemonsets) 为每个 origin identity **额外添加**信任 `system:serviceaccount:unbounded-system:racer` 的 FIC，保留旧 FIC 到 rollout/读取验收成功后再清理。operator 会清理其管理的旧对象；`racer-dataplane-config` 迁移到 `racer-settings`。在批准的维护窗口内协调 operator、dataplane 和应用 sidecar 升级；不要假设跨版本兼容，也不要手动删除 cache、identity 或 checkpoint。本节其余步骤按新测试集群安装编写。
 
 ### 2.1 安装 CLI 和 operator
 
 Linux amd64 构建机/管理机执行；下载的是 **tar.gz**，不是裸二进制：
 
 ```bash
-mkdir -p /tmp/racer-v018 "$HOME/.local/bin"
-curl -fL -o /tmp/racer-v018/plugin.tar.gz \
-  https://github.com/Azure/unbounded/releases/download/v0.18.0/kubectl-unbounded-linux-amd64.tar.gz
+mkdir -p /tmp/racer-v027 "$HOME/.local/bin"
+curl -fL -o /tmp/racer-v027/plugin.tar.gz \
+  https://github.com/Azure/unbounded/releases/download/v0.27.0/kubectl-unbounded-linux-amd64.tar.gz
 printf '%s  %s\n' \
-  dd9e41f857c08c783071c8d6772bcf477f3a26a7a47d556dd9ebcb0197a0daa0 \
-  /tmp/racer-v018/plugin.tar.gz | sha256sum -c -
-tar -xzf /tmp/racer-v018/plugin.tar.gz -C /tmp/racer-v018
-install -m 0755 /tmp/racer-v018/kubectl-unbounded "$HOME/.local/bin/kubectl-unbounded"
+  6e2e985b2eb634e68a0a9fd9fc0b7f514c562196921912874cb2538d36ca3931 \
+  /tmp/racer-v027/plugin.tar.gz | sha256sum -c - || exit 1
+tar -xzf /tmp/racer-v027/plugin.tar.gz -C /tmp/racer-v027
+install -m 0755 /tmp/racer-v027/kubectl-unbounded "$HOME/.local/bin/kubectl-unbounded"
 export PATH="$HOME/.local/bin:$PATH"
 kubectl unbounded version
 kubectl unbounded install --namespace unbounded-system --timeout=5m
 kubectl -n unbounded-system rollout status deployment/unbounded-operator --timeout=5m
 ```
 
-operator 留在 `unbounded-system`；工作负载仍在 `kaito-workspace`。官方发行版使用 `ghcr.io/azure/{unbounded-operator,racer-controller,racer-dataplane,racer-object}:v0.18.0`，这些镜像的 manifest 已通过匿名拉取接口核对。无需私有 Racer 源码；受限网络须先允许访问 GitHub/GHCR，或由管理员提供同版本镜像镜像仓库并使用 CLI 的 `--image-registry`。本仓库不代替提供 AKS、Azure identity、模型数据或 KAITO 构建镜像。
+operator 留在 `unbounded-system`；工作负载仍在 `kaito-workspace`。官方发行版使用 `ghcr.io/azure/{unbounded-operator,racer,racer-object}:v0.27.0`；其 [release BOM](https://github.com/Azure/unbounded/releases/download/v0.27.0/unbounded-release-bom-v0.27.0.json) digest 已与 GHCR 匿名 manifest 核对，CLI 包已与官方 checksums 核对（不等于执行过 cosign 签名验证）。无需私有 Racer 源码；受限网络须先允许访问 GitHub/GHCR，或由管理员提供同版本镜像镜像仓库并使用 CLI 的 `--image-registry`。本仓库不代替提供 AKS、Azure identity、模型数据或 KAITO 构建镜像。
 
 ### 2.2 只选择 GPU 节点上的专用空闲 NVMe
 
@@ -72,14 +102,14 @@ ls -l "/sys/class/block/$(basename "$(readlink -f "$DEVICE")")/holders"
 sudo fuser -v "$DEVICE"
 ```
 
-由磁盘所有者确认：无分区、无 holders、无挂载/交换区/进程占用、无其他用途，且允许丢弃全部内容；上述检查不能代替所有权确认。v0.18.0 还要求设备首尾各 1 MiB 已全零，不满足会拒绝设备；清理旧内容是另一个需要单独批准的运维操作。保留 `/var/lib/racer/identity`；slabs 目录仍用于 checkpoint，不可删除。
+由磁盘所有者确认：无分区、无 holders、无挂载/交换区/进程占用、无其他用途，且允许丢弃全部内容；上述检查不能代替所有权确认。v0.27.0 还要求设备首尾各 1 MiB 已全零，不满足会拒绝设备；清理旧内容是另一个需要单独批准的运维操作。保留 `/var/lib/racer/identity`；slabs 目录仍用于 checkpoint，不可删除。
 
 确认后才在管理机上为**每一个**所选 GPU 节点设置精确匹配的 annotation 和 opt-in label：
 
 ```bash
 export GPU_NODE=YOUR_VERIFIED_GPU_NODE
 export NVME_BY_ID=YOUR_DEDICATED_NVME_BY_ID_BASENAME
-# 仅转义正则元字符，生成 Go/Rust 都接受的单个 by-id 精确匹配式。
+# 仅转义正则元字符，生成 Rust regex 接受的单个 by-id 精确匹配式。
 NVME_PATTERN=$(python3 - <<'PY'
 import os, re
 s = os.environ['NVME_BY_ID']
@@ -92,11 +122,11 @@ kubectl annotate node "$GPU_NODE" "racer.unbounded-cloud.io/block-devices=$NVME_
 kubectl label node "$GPU_NODE" kaito.sh/racer-nvme=true --overwrite
 ```
 
-例如精确形式为 `^nvme-eui\.0123456789abcdef$`，实际 ID 必须来自该节点，**不要用 `nvme-.*`**。annotation 匹配 `/dev/disk/by-id` 的 basename，支持 Go/Rust 正则；未匹配/设备被拒绝/容量不足会回退到文件 slab，不能把 Pod Ready 当作 NVMe 已启用。
+例如精确形式为 `^nvme-eui\.0123456789abcdef$`，实际 ID 必须来自该节点，**不要用 `nvme-.*`**。annotation 在容器内匹配 `/host/dev/disk/by-id` 的 basename，使用 Rust regex，限 1024 bytes；此流程要求 host 有 `/dev/disk/by-id`。未匹配/设备被拒绝/容量不足会回退到文件 slab，不能把 Pod Ready 当作 NVMe 已启用。
 
 ### 2.3 在创建 cache 前限制 dataplane 调度
 
-用 operator 支持的 overrides，而不是直接编辑它管理的 DaemonSet。下面只允许带上一节 opt-in label 的 GPU 节点，并容忍常见 GPU taint；按实际 taint 调整，不要泛化成容忍全部 taint。origin 会继承 dataplane 的 selector/affinity/tolerations。
+用 operator 支持的 overrides，而不是直接编辑它管理的 DaemonSet。下面只允许带上一节 opt-in label 的 GPU 节点，并容忍常见 GPU taint；按实际 taint 调整，不要泛化成容忍全部 taint。v0.27.0 的 Azure origin 直接在同一 dataplane Pod 内运行，没有单独的 origin 调度配置。
 
 ```bash
 cat > /tmp/racer-placement.yaml <<'EOF'
@@ -144,8 +174,8 @@ ORIGIN_PRINCIPAL_ID=$(az identity show -g "$IDENTITY_RESOURCE_GROUP" -n "$ORIGIN
 OIDC_ISSUER=$(az aks show -g "$AKS_RESOURCE_GROUP" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 az identity federated-credential create \
   --resource-group "$IDENTITY_RESOURCE_GROUP" --identity-name "$ORIGIN_IDENTITY_NAME" \
-  --name kaito-racer-origin --issuer "$OIDC_ISSUER" \
-  --subject "system:serviceaccount:unbounded-system:racer-origin-${CACHE_NAME}" \
+  --name kaito-racer-v027 --issuer "$OIDC_ISSUER" \
+  --subject "system:serviceaccount:unbounded-system:racer" \
   --audiences api://AzureADTokenExchange
 az role assignment create --assignee-object-id "$ORIGIN_PRINCIPAL_ID" \
   --assignee-principal-type ServicePrincipal --role 'Storage Blob Data Reader' \
@@ -163,17 +193,15 @@ spec:
         workloadIdentity:
           clientID: ${ORIGIN_CLIENT_ID}
 EOF
-kubectl -n unbounded-system rollout status deployment/racer-controller --timeout=5m
-kubectl -n unbounded-system rollout status daemonset/racer-dataplane --timeout=5m
-kubectl -n unbounded-system rollout status "daemonset/racer-origin-${CACHE_NAME}" --timeout=5m
+kubectl -n unbounded-system rollout status daemonset/racer --timeout=5m
+kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
 kubectl unbounded overrides status
-kubectl -n unbounded-system get daemonset racer-dataplane "racer-origin-${CACHE_NAME}" -o yaml
+kubectl -n unbounded-system get daemonset racer -o yaml
 kubectl -n unbounded-system get pods -o wide
-kubectl -n unbounded-system logs daemonset/racer-dataplane -c dataplane --tail=100
-kubectl -n unbounded-system logs "daemonset/racer-origin-${CACHE_NAME}" --tail=100
+kubectl -n unbounded-system logs daemonset/racer -c dataplane --tail=100
 ```
 
-ClusterCache 是 cluster-scoped，没有 workload namespace。创建它后 operator 才自动部署 Racer controller/dataplane/origin；短暂 NotFound 时等资源出现再运行 rollout 检查。逐 GPU 节点检查 dataplane 日志中的设备选择/拒绝/文件回退，不能仅看 DaemonSet 的期望数或单个 Pod 日志；所有推理 rank 必须落在实际有 Racer socket 的节点。origin 不能切换容器，换源要新建 cache。SAS/shared key 不是此安装路径的鉴权方式，不能给 provider/sidecar 放 Azure token。
+ClusterCache 是 cluster-scoped，没有 workload namespace。创建它后 operator 才自动部署 `racer` DaemonSet（含选举的 control seats 和内置 Azure origin）；短暂 NotFound 时等资源出现再运行 rollout 检查。逐 GPU 节点检查 dataplane 日志中的设备选择/拒绝/文件回退，不能仅看 DaemonSet 的期望数或单个 Pod 日志；所有推理 rank 必须落在实际有 Racer socket 的节点。origin 不能切换容器，换源要新建 cache。SAS/shared key 不是此安装路径的鉴权方式，不能给 provider/sidecar 放 Azure token。origin 使用 operator 为 `racer` ServiceAccount 投射的 Entra token；这不替代应用自身 metadata/listing 所用的 streaming WI。不要添加未经 v0.27.0 定义的 `rawNVMe` CRD 字段；裸设备由上面的 Node annotation 配置。
 
 ## 第三步：构建并推送 KAITO 控制器和 runtime
 
@@ -202,7 +230,7 @@ docker push "$RACER_STREAMING_IMAGE"
 编辑 [values 示例](../examples/racer-model-streaming-values.yaml)：`namespace: kaito-workspace`，`account`/`container`/`cacheName` 使用前面的实际值；`runtimeImage` 填第三步推送的镜像；`objectImage` 使用与 server 同版本的公开 sidecar：
 
 ```text
-ghcr.io/azure/racer-object@sha256:83156c106d243d5c4552698fe3eddc614128f3f74210d025b0a556800be77b1e
+ghcr.io/azure/racer-object@sha256:5c43d6c4dd2a18998568be84252040f88f6be7b93ec2e55fdf0ddeb8a92663ba
 ```
 
 保留原有 Workload Identity、StorageClass 等 values。只升级**现有** workspace Helm release，不在托管控制器旁安装第二份；非 Helm/AKS 托管安装先按其受支持的更新方式切换自定义控制器。
@@ -234,7 +262,7 @@ kubectl -n kaito-workspace get statefulsets -o yaml
 
 启用开关是 `kaito.sh/model-cache: racer`，runtime 用 `kaito.sh/runtime: vllm`。用新 Workspace 测试；旧 StatefulSet 并非所有字段都能随 annotation 更新。
 
-逐一检查**全部 rank**：runtime 镜像正确、provider env 存在、`racer-object` 为 `restartPolicy: Always` 的 native sidecar；它挂载 `/run/racer/${CACHE_NAME}/client`，运行 `sidecar --api=azure --cache=... --listen=127.0.0.1:18080`。KAITO 已负责注入，不要再开启 Racer webhook 的 sidecar 注入标签。endpoint 仅 Pod 内可见，无 Service/Ingress；HTTP 路径是 **`/<container>/<blob-key>`**，不是只有 blob key。
+逐一检查**全部 rank**：runtime 镜像正确、provider env 存在、`racer-object` 为 `restartPolicy: Always` 的 native sidecar；它挂载 `/run/racer/${CACHE_NAME}/client`，运行 `sidecar --api=azure --cache=... --listen=127.0.0.1:18080`。KAITO 已负责注入，不要再开启 Racer webhook 的 `object-sidecar` 或 `client-socket` 注入标签。endpoint 仅 Pod 内可见，无 Service/Ingress；HTTP 路径是 **`/<container>/<blob-key>`**，不是只有 blob key。
 
 在每个推理 Pod 的应用容器内，用 Python 做一次真实范围读取（替换实际 blob key，不下载整个权重）：
 
@@ -257,4 +285,4 @@ PY
 
 ## 验证边界
 
-已有本地检查覆盖 Go controller/provider 单测、provider race、9 项真实 `.so` ABI 测试、控制器编译及 Helm 渲染。本次安装文档额外核对了 v0.18.0 源码、发行包校验和、CLI 帮助和公开镜像 manifest；示例用离线回归检查。**仍未构建/推送这些 Docker 镜像，未安装集群，未验证 AKS NVMe、Azure WI、GPU 或缓存性能**。本地/mock 测试不能替代以上部署验收。
+此前 PoC 记录过 Go controller/provider 单测、provider race、9 项真实 `.so` ABI 测试、控制器编译及 Helm 渲染；不代表这些检查在每次文档升级中均已重跑。本次 v0.27.0 升级核对了 tag 源码、发行包校验和、CLI 帮助、overrides 离线校验及 release BOM/公开镜像 manifest。源码中的 sidecar flags、`/run/racer/<cache>/client`、`/<container>/<blob>`、单 Range/206/Content-Range 契约仍与 provider 一致，无需改变 KAITO provider ABI；这不是运行真实 v0.27.0 dataplane 的集成测试。本次重跑的 controller/provider 普通单测、Helm lint/render、10 个存储解析 mock 场景及 Bash 语法检查通过；环境缺少 GNU Make 和 C compiler，无法重跑完整 Make 检查、race 或 `.so` ABI 测试。**仍未构建/推送这些 Docker 镜像，未安装集群，未验证 AKS NVMe、Azure WI、GPU 或缓存性能**。本地/mock 测试不能替代以上部署验收。

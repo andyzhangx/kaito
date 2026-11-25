@@ -27,7 +27,7 @@ import (
 )
 
 func bindingFixture() RacerBinding {
-	return RacerBinding{Namespace: "team-a", Account: "account123", Container: "models-test", CacheName: "team-a-models", ObjectImage: "example.invalid/racer-object:v0.18.0", RuntimeImage: "example.invalid/kaito-racer:poc", Immutable: true}
+	return RacerBinding{Namespace: "team-a", Account: "account123", Container: "models-test", CacheName: "team-a-models", ObjectImage: "example.invalid/racer-object:v0.27.0", RuntimeImage: "example.invalid/kaito-racer:poc", Immutable: true}
 }
 func installBinding(t *testing.T) {
 	t.Helper()
