@@ -125,7 +125,7 @@ class RacerBuildTargets(unittest.TestCase):
     def test_existing_workspace_command_unchanged(self):
         _, calls = self.run_make("docker-build-workspace", "ARCH=amd64")
         call = self.build_call(calls)
-        self.assertIn("./docker/workspace/Dockerfile", call)
+        self.assertIn("./build/workspace/Dockerfile", call)
         self.assertIn("--platform=linux/amd64", call)
         self.assertIn("--output=type=docker", call)
         self.assertEqual(call[call.index("--tag") + 1], "andyzhangx/workspace:0.13.0-racer")
