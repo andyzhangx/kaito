@@ -149,7 +149,22 @@ kubectl annotate node "$GPU_NODE" "racer.unbounded-cloud.io/block-devices=$NVME_
 kubectl label node "$GPU_NODE" kaito.sh/racer-nvme=true
 ```
 
-例如 `^nvme-eui\.0123456789abcdef$`；**不要用 `nvme-.*`**。此流程要求 host 有 `/dev/disk/by-id`；Rust regex 精确匹配容器内 `/host/dev/disk/by-id` 的 basename。已有不同 annotation/label 时命令会失败，先审阅而不是覆盖。设备选择只在 dataplane 启动时读取，因此必须在创建 cache 之前完成。
+此流程要求 host 有 `/dev/disk/by-id`；Rust regex 精确匹配容器内 `/host/dev/disk/by-id` 的 **basename**，不是完整路径或 shell glob。已有不同 annotation/label 时命令会失败，先审阅而不是覆盖。设备选择只在 dataplane 启动时读取，因此必须在创建 cache 之前完成。
+
+**A100 示例：精确匹配一个设备别名。** 已检查的 `Standard_NC24ads_A100_v4` 节点上，以下两个 by-id 链接都指向 `/dev/nvme0n1`，不是两块磁盘：
+
+```text
+nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001   -> ../../nvme0n1
+nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001_1 -> ../../nvme0n1
+```
+
+在**确认该盘专供可丢弃缓存并获准覆盖后**，选不带 `_1` 的别名作为上面的 `NVME_BY_ID`，生成的 annotation 为：
+
+```yaml
+racer.unbounded-cloud.io/block-devices: '^nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001$'
+```
+
+这个序列号只适用于当前设备，**不是 A100/H100 通用名称**。其他节点或替换后的节点必须重新检查，并使用各自的精确 `^...$`；**不要用 `nvme-.*` 或 `^nvme-Microsoft_NVMe_Direct_Disk_.*$`**。未匹配到可用设备时可能回退到文件缓存，因此 Pod Running 不能证明已使用 NVMe，仍需检查后文的实际 slab 指标。
 
 用 operator 支持的 overrides 限制调度，不直接编辑其 DaemonSet。下面只允许 opt-in 节点并容忍常见 GPU taint；按实际 taint 调整，不泛化为容忍全部 taint：
 
