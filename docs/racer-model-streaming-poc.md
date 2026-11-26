@@ -101,70 +101,36 @@ kubectl wait --for=condition=Established crd/clustercaches.racer.unbounded-cloud
 
 operator 留在 `unbounded-system`，应用仍在 `kaito-workspace`。**此时没有 `daemonset/racer` 是正常的**：它在首次创建 ClusterCache 后才部署。官方镜像为 `ghcr.io/azure/{unbounded-operator,racer,racer-object}:v0.27.0`；[release BOM](https://github.com/Azure/unbounded/releases/download/v0.27.0/unbounded-release-bom-v0.27.0.json) digest 已与 GHCR 匿名 manifest 核对，CLI 包已与官方 checksums 核对（不等于执行过 cosign 签名验证）。无需私有 Racer 源码；管理机/集群需能访问 GitHub/GHCR，受限网络可由管理员将同版本镜像同步到可访问的仓库，并使用 CLI 的 `--image-registry`。
 
-### 2.3 GPU 节点 host：确认专用、可丢弃的 NVMe
+### 2.3 GPU 节点 host：确认目标 NVMe
 
-**Racer 会覆盖选中设备的缓存区域；这里不执行 wipe/mkfs 或任何原始磁盘写入。** 不得选择 OS、AKS 临时/ephemeral OS、kubelet、containerd、模型、PV 或其他已分配磁盘。GPU VM 有 NVMe 不代表它空闲；没有专用可丢弃设备就停止本 NVMe 方案。
+下面使用已检查的 A100 节点及设备作为示例；**Racer raw-device 会覆盖磁盘内容，须先由所有者确认该盘专供可丢弃缓存并批准使用**。不得使用 OS/ephemeral OS、kubelet、containerd、模型或 PV 已占用的盘。
 
-先在**管理机**列出 GPU 节点、节点池和 taint：
-
-```bash
-kubectl get nodes -L agentpool,node.kubernetes.io/instance-type
-kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,TAINTS:.spec.taints'
-```
-
-再通过已批准的节点登录方式，在**每个候选 GPU 节点的 host shell** 只读检查；下列命令不是在管理机执行：
+在该 GPU 节点的 **host shell** 只读检查：
 
 ```bash
-lsblk -e7 -o NAME,PATH,TYPE,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINTS
-find /dev/disk/by-id -maxdepth 1 -type l -name 'nvme-*' -printf '%f -> %l\n'
-findmnt
-swapon --show
-DEVICE=/dev/disk/by-id/YOUR_DEDICATED_NVME_ID # 此节点实际选中的整盘
-readlink -f "$DEVICE"
-lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINTS "$DEVICE"
+DEVICE=/dev/disk/by-id/nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001
+readlink -f "$DEVICE" # 当前节点应为 /dev/nvme0n1
+lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS "$DEVICE"
 ls -l "/sys/class/block/$(basename "$(readlink -f "$DEVICE")")/holders"
-sudo fuser -v "$DEVICE"
+swapon --show
 ```
 
-由磁盘所有者结合节点池配置确认：无分区、无 holders、无挂载/交换区/进程占用、无其他用途，允许丢弃全部内容。`lsblk` 等输出及 `fuser` 无输出都**不能单独证明所有权或安全**；排查读取/权限错误，不要当作空盘。v0.27.0 要求设备**首尾各 1 MiB 已全零**，否则启动时拒绝设备；如果需要清理，停止并另行申请磁盘操作批准。记录每台节点与选中 by-id 的对应关系。
+无挂载不等于可安全覆盖，仍需确认无分区、holders、进程占用或其他用途。v0.27.0 还要求设备首尾各 1 MiB 全零；不满足时停止并另行申请清理批准，本节不执行擦盘。`...000001` 与 `...000001_1` 是同一 `/dev/nvme0n1` 的两个别名，选前者即可。
 
-### 2.4 管理机：逐节点 opt-in，并限制 Racer 调度
+### 2.4 管理机：设置固定正则并限制调度
 
-仅在磁盘确认后，为**每一个**所选 GPU 节点执行；`NVME_BY_ID` 是该节点上 `/dev/disk/by-id/` 后面的实际 basename，不是占位符或整条路径：
+**仅在完成上述确认后**，在管理机直接设置精确表达式，无需动态生成：
 
 ```bash
-export GPU_NODE=YOUR_VERIFIED_GPU_NODE
-export NVME_BY_ID=YOUR_DEDICATED_NVME_BY_ID_BASENAME
-NVME_PATTERN=$(python3 - <<'PY'
-import os, re
-s = os.environ['NVME_BY_ID']
-assert s.startswith('nvme-') and '/' not in s and not re.search(r'-part[0-9]+$', s)
-pattern = '^' + ''.join('\\' + c if c in r'\.^$|?*+()[]{}' else c for c in s) + '$'
-assert len(pattern.encode()) <= 1024
-print(pattern)
-PY
-)
-printf '%s: %s\n' "$GPU_NODE" "$NVME_PATTERN"
-kubectl annotate node "$GPU_NODE" "racer.unbounded-cloud.io/block-devices=$NVME_PATTERN"
+GPU_NODE=aks-ws4fd45a3ae-15362417-vmss000000
+kubectl annotate node "$GPU_NODE" \
+  'racer.unbounded-cloud.io/block-devices=^nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001$'
 kubectl label node "$GPU_NODE" kaito.sh/racer-nvme=true
 ```
 
-此流程要求 host 有 `/dev/disk/by-id`；Rust regex 精确匹配容器内 `/host/dev/disk/by-id` 的 **basename**，不是完整路径或 shell glob。已有不同 annotation/label 时命令会失败，先审阅而不是覆盖。设备选择只在 dataplane 启动时读取，因此必须在创建 cache 之前完成。
+正则匹配 `/host/dev/disk/by-id` 的 basename，不带路径。**节点名和序列号仅适用于当前示例**，其他节点或重建后需重新核对，勿改成 `nvme-.*`。不加 `--overwrite`，已有配置冲突时先审阅。必须在首次创建 cache 前完成；设备选择仅在 dataplane 启动时读取。
 
-**A100 示例：精确匹配一个设备别名。** 已检查的 `Standard_NC24ads_A100_v4` 节点上，以下两个 by-id 链接都指向 `/dev/nvme0n1`，不是两块磁盘：
-
-```text
-nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001   -> ../../nvme0n1
-nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001_1 -> ../../nvme0n1
-```
-
-在**确认该盘专供可丢弃缓存并获准覆盖后**，选不带 `_1` 的别名作为上面的 `NVME_BY_ID`，生成的 annotation 为：
-
-```yaml
-racer.unbounded-cloud.io/block-devices: '^nvme-Microsoft_NVMe_Direct_Disk_2fe19d8b05b600000001$'
-```
-
-这个序列号只适用于当前设备，**不是 A100/H100 通用名称**。其他节点或替换后的节点必须重新检查，并使用各自的精确 `^...$`；**不要用 `nvme-.*` 或 `^nvme-Microsoft_NVMe_Direct_Disk_.*$`**。未匹配到可用设备时可能回退到文件缓存，因此 Pod Running 不能证明已使用 NVMe，仍需检查后文的实际 slab 指标。
+**调度限制仍须保留**：磁盘正则不限制 Pod 调度，其他节点没有匹配设备时可能回退到文件缓存。安装后按后文 slab 指标确认实际使用了 NVMe。
 
 用 operator 支持的 overrides 限制调度，不直接编辑其 DaemonSet。下面只允许 opt-in 节点并容忍常见 GPU taint；按实际 taint 调整，不泛化为容忍全部 taint：
 
