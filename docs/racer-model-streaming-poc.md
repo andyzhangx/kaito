@@ -132,7 +132,13 @@ kubectl label node "$GPU_NODE" kaito.sh/racer-nvme=true
 
 **调度限制仍须保留**：磁盘正则不限制 Pod 调度，其他节点没有匹配设备时可能回退到文件缓存。安装后按后文 slab 指标确认实际使用了 NVMe。
 
-用 operator 支持的 overrides 限制调度，不直接编辑其 DaemonSet。下面只允许 opt-in 节点并容忍常见 GPU taint；按实际 taint 调整，不泛化为容忍全部 taint：
+用 operator 支持的 overrides 限制调度，不直接编辑其 DaemonSet。先检查目标节点的实际 taint：
+
+```bash
+kubectl get node "$GPU_NODE" -o jsonpath='{.spec.taints}{"\n"}'
+```
+
+下面只允许 opt-in 节点，并容忍 `nvidia.com/gpu:NoSchedule` 和本 PoC A100 节点使用的 `sku=gpu:NoSchedule`。两个 key 不同，不能互相匹配；若遗漏 `sku=gpu`，DaemonSet 可能显示 `DESIRED=0`，而不是创建 Pending Pod。按实际 taint 调整，不泛化为容忍全部 taint：
 
 ```bash
 cat > /tmp/racer-placement.yaml <<'EOF'
@@ -149,6 +155,10 @@ overrides:
             tolerations:
               - key: nvidia.com/gpu
                 operator: Exists
+                effect: NoSchedule
+              - key: sku
+                operator: Equal
+                value: gpu
                 effect: NoSchedule
 EOF
 kubectl unbounded overrides validate -f /tmp/racer-placement.yaml
