@@ -174,38 +174,77 @@ PY
 fi
 ```
 
-### 2.5 管理机：给 Azure origin 配置独立 identity
+### 2.5 管理机：沿用 Model Streaming 的 identity，为 Azure origin 新增绑定
 
-本例要求**已准备好专用于 Racer origin 的 user-assigned identity**，并有创建 FIC/角色分配的权限；尚未准备时先请 Azure 管理员创建再继续。不要复用 streaming 的 `model-reader` 绑定，它仍独立负责应用 metadata/listing。填写 identity 和**第一步已有 storage account** 各自的实际订阅/资源组，不能假定它们与 AKS 相同，也不要新建空容器：
+本 PoC 可以复用 [KAITO Model Streaming 官方指南](https://kaito-project.github.io/kaito/docs/model-mirror-streaming/) 中的 kubelet user-assigned managed identity，并沿用同名的 `KUBELET_*`、`OIDC_ISSUER` 变量，无需再创建独立的 origin identity。
+
+**复用 identity 不等于复用 ServiceAccount/FIC。** 保留第一步 streaming ServiceAccount 的原有 FIC，它仍负责应用 metadata/listing；在同一个 identity 上，为 Racer 的 `system:serviceaccount:unbounded-system:racer` **新增另一条 FIC**，不能替换原绑定。
+
+如果仍在执行官方指南的 shell 中，可以沿用其 identity 变量。为方便重新打开 shell 后执行，下面从 2.1 的 AKS 参数恢复官方指南同名变量；必须使用第一步 Model Streaming 所在的同一个集群：
 
 ```bash
-export IDENTITY_SUBSCRIPTION_ID=YOUR_IDENTITY_SUBSCRIPTION_ID
-export IDENTITY_RESOURCE_GROUP=YOUR_IDENTITY_RESOURCE_GROUP
-export ORIGIN_IDENTITY_NAME=YOUR_DEDICATED_ORIGIN_IDENTITY_NAME
+: "${AKS_SUBSCRIPTION_ID:?}" "${AKS_RESOURCE_GROUP:?}" "${AKS_NAME:?}"
+SUBSCRIPTION="$AKS_SUBSCRIPTION_ID"
+RESOURCE_GROUP="$AKS_RESOURCE_GROUP"
+CLUSTER_NAME="$AKS_NAME"
+
+KUBELET_RESOURCE_ID=$(az aks show --subscription "$SUBSCRIPTION" \
+  --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" \
+  --query identityProfile.kubeletidentity.resourceId -o tsv)
+KUBELET_CLIENT_ID=$(az aks show --subscription "$SUBSCRIPTION" \
+  --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" \
+  --query identityProfile.kubeletidentity.clientId -o tsv)
+KUBELET_OBJECT_ID=$(az aks show --subscription "$SUBSCRIPTION" \
+  --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" \
+  --query identityProfile.kubeletidentity.objectId -o tsv)
+: "${KUBELET_RESOURCE_ID:?}" "${KUBELET_CLIENT_ID:?}" "${KUBELET_OBJECT_ID:?}"
+KUBELET_IDENTITY_NAME=$(basename "$KUBELET_RESOURCE_ID")
+KUBELET_IDENTITY_RG=$(echo "$KUBELET_RESOURCE_ID" | cut -d/ -f5)
+OIDC_ISSUER=$(az aks show --subscription "$SUBSCRIPTION" \
+  --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" \
+  --query oidcIssuerProfile.issuerUrl -o tsv)
+: "${KUBELET_IDENTITY_NAME:?}" "${KUBELET_IDENTITY_RG:?}" "${OIDC_ISSUER:?}"
+
+# 从 identity resource ID 获取实际订阅，不假定 identity 一定位于 AKS 订阅。
+# 使用区别于 streaming 原 FIC 的名称；若同名 FIC 已存在，先核对其内容。
+az identity federated-credential create \
+  --subscription "$(echo "$KUBELET_RESOURCE_ID" | cut -d/ -f3)" \
+  --resource-group "$KUBELET_IDENTITY_RG" \
+  --identity-name "$KUBELET_IDENTITY_NAME" \
+  --name "racer-wi-${CLUSTER_NAME}" \
+  --issuer "$OIDC_ISSUER" \
+  --subject "system:serviceaccount:unbounded-system:racer" \
+  --audiences "api://AzureADTokenExchange"
+```
+
+**检查已有 Blob 权限是否覆盖实际 origin。** 官方指南在 AKS `MC_` 资源组作用域授予 `Storage Blob Data Reader`；如果第一步使用的 storage account 位于该资源组中，可以继承已有权限，不必重复授权。如果 storage account 位于其他资源组/订阅，则不能假定已覆盖。
+
+先填写**第一步已有 storage account** 的实际订阅/资源组并检查权限，不要新建空容器：
+
+```bash
 export STORAGE_SUBSCRIPTION_ID=YOUR_EXISTING_STORAGE_SUBSCRIPTION_ID
 export STORAGE_RESOURCE_GROUP=YOUR_EXISTING_STORAGE_RESOURCE_GROUP
-ORIGIN_CLIENT_ID=$(az identity show --subscription "$IDENTITY_SUBSCRIPTION_ID" \
-  -g "$IDENTITY_RESOURCE_GROUP" -n "$ORIGIN_IDENTITY_NAME" --query clientId -o tsv)
-ORIGIN_PRINCIPAL_ID=$(az identity show --subscription "$IDENTITY_SUBSCRIPTION_ID" \
-  -g "$IDENTITY_RESOURCE_GROUP" -n "$ORIGIN_IDENTITY_NAME" --query principalId -o tsv)
-OIDC_ISSUER=$(az aks show --subscription "$AKS_SUBSCRIPTION_ID" \
-  -g "$AKS_RESOURCE_GROUP" -n "$AKS_NAME" --query oidcIssuerProfile.issuerUrl -o tsv)
 STORAGE_ACCOUNT_RESOURCE_ID=$(az storage account show --subscription "$STORAGE_SUBSCRIPTION_ID" \
   -g "$STORAGE_RESOURCE_GROUP" -n "$ACCOUNT" --query id -o tsv)
-: "${ORIGIN_CLIENT_ID:?}" "${ORIGIN_PRINCIPAL_ID:?}" "${OIDC_ISSUER:?}" "${STORAGE_ACCOUNT_RESOURCE_ID:?}"
+: "${STORAGE_ACCOUNT_RESOURCE_ID:?}" "${CONTAINER:?}"
 STORAGE_CONTAINER_RESOURCE_ID="$STORAGE_ACCOUNT_RESOURCE_ID/blobServices/default/containers/$CONTAINER"
 printf 'Origin role scope: %s\n' "$STORAGE_CONTAINER_RESOURCE_ID"
-az identity federated-credential create --subscription "$IDENTITY_SUBSCRIPTION_ID" \
-  --resource-group "$IDENTITY_RESOURCE_GROUP" --identity-name "$ORIGIN_IDENTITY_NAME" \
-  --name kaito-racer --issuer "$OIDC_ISSUER" \
-  --subject system:serviceaccount:unbounded-system:racer \
-  --audiences api://AzureADTokenExchange
+az role assignment list --subscription "$STORAGE_SUBSCRIPTION_ID" \
+  --assignee "$KUBELET_OBJECT_ID" --scope "$STORAGE_CONTAINER_RESOURCE_ID" \
+  --include-inherited --all -o table
+```
+
+仅在确认没有覆盖目标容器的 Blob 读取权限时，由有角色分配权限的管理员补充：
+
+```bash
 az role assignment create --subscription "$STORAGE_SUBSCRIPTION_ID" \
-  --assignee-object-id "$ORIGIN_PRINCIPAL_ID" --assignee-principal-type ServicePrincipal \
+  --assignee-object-id "$KUBELET_OBJECT_ID" --assignee-principal-type ServicePrincipal \
   --role 'Storage Blob Data Reader' --scope "$STORAGE_CONTAINER_RESOURCE_ID"
 ```
 
-身份与 AKS OIDC 的 Entra tenant 必须匹配本环境；不要把不同 tenant 的 identity 当作默认可用。origin 使用 operator 为 `unbounded-system/racer` ServiceAccount 投射的 token；不向 provider/sidecar 放 Azure token，此路径不支持 SAS/shared key。
+身份与 AKS OIDC 的 Entra tenant 必须匹配本环境；不要把不同 tenant 的 identity 当作默认可用。origin 使用 operator 为 `unbounded-system/racer` ServiceAccount 投射的 token；不向 provider/sidecar 放 Azure token，此路径不支持 SAS/shared key。FIC/RBAC 传播需要时间，最终需验证实际 origin 读取；角色存在也不代表网络访问一定可达。
+
+> **权限边界：**FIC 只决定哪个 ServiceAccount 可以使用 identity，不会隔离该 identity 已有的 Azure 权限。复用 kubelet identity 会使 Racer 能够使用该 identity 的其他已授予权限；新增容器级 Reader 不会缩小这些权限。受控 PoC 可以复用，生产环境若要求最小权限和独立审计，仍建议使用仅有目标容器读取权限的专用 identity。
 
 ### 2.6 管理机：最后创建 ClusterCache
 
@@ -223,7 +262,7 @@ spec:
       containerURL: https://${ACCOUNT}.blob.core.windows.net/${CONTAINER}
       credential:
         workloadIdentity:
-          clientID: ${ORIGIN_CLIENT_ID}
+          clientID: ${KUBELET_CLIENT_ID}
 EOF
 kubectl -n unbounded-system get daemonset racer
 ```
