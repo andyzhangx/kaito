@@ -229,9 +229,14 @@ STORAGE_ACCOUNT_RESOURCE_ID=$(az storage account show --subscription "$STORAGE_S
 : "${STORAGE_ACCOUNT_RESOURCE_ID:?}" "${CONTAINER:?}"
 STORAGE_CONTAINER_RESOURCE_ID="$STORAGE_ACCOUNT_RESOURCE_ID/blobServices/default/containers/$CONTAINER"
 printf 'Origin role scope: %s\n' "$STORAGE_CONTAINER_RESOURCE_ID"
-az role assignment list --subscription "$STORAGE_SUBSCRIPTION_ID" \
-  --assignee "$KUBELET_OBJECT_ID" --scope "$STORAGE_CONTAINER_RESOURCE_ID" \
-  --include-inherited --all -o table
+az role assignment list \
+  --subscription "$STORAGE_SUBSCRIPTION_ID" \
+  --assignee-object-id "$KUBELET_OBJECT_ID" \
+  --scope "$STORAGE_CONTAINER_RESOURCE_ID" \
+  --include-inherited \
+  --fill-principal-name false \
+  --query '[].{Role:roleDefinitionName,Scope:scope,PrincipalId:principalId}' \
+  -o table
 ```
 
 仅在确认没有覆盖目标容器的 Blob 读取权限时，由有角色分配权限的管理员补充：
