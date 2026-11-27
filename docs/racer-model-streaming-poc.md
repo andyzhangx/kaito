@@ -304,7 +304,7 @@ kubectl -n unbounded-system logs "$RACER_POD" -c dataplane
 - 每个 Pod 的启动日志确认选中该节点的预期设备；排查设备拒绝、容量不足和文件 slab 回退。无匹配/设备不可用时会回退，**Ready 不等于 NVMe 成功**；没有设备使用证据就停止，不能把文件缓存测试当作 NVMe 测试。`/var/lib/racer/slabs` 仍保存 checkpoint，其目录存在不代表回退；保留 identity/checkpoint 目录。
 - 日志无 origin 鉴权错误，但这不等于读权限已验收。完成第三至五步后，必须用第一步已有模型执行实际冷/热读取，检查 origin 读取成功及缓存命中；FIC/RBAC 传播期间的 403/503 要诊断，不用透明 Azure 回退掩盖失败。所有推理 rank 必须落在实际有 Racer socket 的目标节点。
 
-以上仅是首次安装流程，本文尚未执行实际 AKS/GPU 部署或 NVMe/读取验收。
+以上是首次安装流程。已观察到一次测试集群的 Racer DaemonSet/Pod Ready；这不代表完成了 NVMe、模型读取或性能验收，仍须执行第五步。
 
 ## 第三步：构建并推送 KAITO 控制器和 runtime
 
@@ -352,31 +352,214 @@ helm upgrade "$KAITO_RELEASE" ./charts/kaito/workspace \
 
 这里 `KAITO_CONTROLLER_NAMESPACE` 保持原安装值；不是要求移动控制器。values 文件是 Helm 输入，不能 `kubectl apply`。
 
-## 第五步：创建 Workspace 并验收
+## 第五步：用真实模型验证推理和性能
 
-编辑 [Workspace 示例](../examples/racer-model-streaming-poc.yaml) 中 `model-reader` 的 client ID 和 GPU/preset；为该 identity 配置 FIC subject **`system:serviceaccount:kaito-workspace:model-reader`** 及原 Streaming 所需 Blob 权限（遵循第一步指南）。实际所选 GPU 节点还须满足示例的 `apps: racer-model` selector 和资源需求；KAITO 新建的 GPU 节点必须先完成第二步磁盘审核/标注，不能假设自带可用缓存。
+**验收目标是模型通过 Racer 加载并完成真实推理，不是只看 Workspace Ready 或一次 Range 请求。** 先用示例中的 `microsoft/Phi-4-mini-instruct` 在单张 A100 上跑通，再按需换成第一步已镜像的 Qwen3 等模型；三组对比必须使用相同模型、不可变权重及推理配置。
+
+### 5.1 准备模型、身份和空闲 GPU
+
+完成第三、四步后，先编辑 [Workspace 示例](../examples/racer-model-streaming-poc.yaml)：填写 `model-reader` 的 client ID，确认 preset/GPU；该 identity 必须有 FIC subject **`system:serviceaccount:kaito-workspace:model-reader`** 和第一步要求的 Blob 读取权限。示例中的 Namespace/ServiceAccount 只在首次准备时单独创建或经审阅后更新，不在每轮测试中覆盖已有身份配置。
 
 ```bash
-kubectl apply -f examples/racer-model-streaming-poc.yaml
-kubectl -n kaito-workspace get workspace racer-model -o yaml
-kubectl -n kaito-workspace get pods -o wide
-kubectl -n kaito-workspace get statefulsets -o yaml
+export NS=kaito-workspace
+export GPU_NODE=YOUR_VERIFIED_IDLE_A100_NODE
+export MODEL=microsoft/Phi-4-mini-instruct
+export BENCH_ID=$(date -u +%Y%m%d%H%M%S)
+export RESULTS="$PWD/racer-results-$BENCH_ID"
+mkdir -p "$RESULTS"
+kubectl get workspace -A
+kubectl get pods -A --field-selector "spec.nodeName=$GPU_NODE" -o wide
+kubectl describe node "$GPU_NODE"
+kubectl -n "$NS" get serviceaccount model-reader
+kubectl get node "$GPU_NODE" --show-labels
 ```
 
-启用开关是 `kaito.sh/model-cache: racer`，runtime 用 `kaito.sh/runtime: vllm`。用新 Workspace 测试；旧 StatefulSet 并非所有字段都能随 annotation 更新。
+确认目标节点有足够的**未分配** GPU/CPU/内存，且已完成第二步 NVMe 授权、设备验证及 Racer Ready 检查。若唯一 GPU 已被现有模型占用，**停止并取得服务中断许可**，先保存原 Workspace/配置和恢复方案；不要直接删业务 Workspace、改副本数与 controller 对抗，或为测试自动新增付费 GPU 节点。
 
-逐一检查**全部 rank**：runtime 镜像正确、provider env 存在、`racer-object` 为 `restartPolicy: Always` 的 native sidecar；它挂载 `/run/racer/${CACHE_NAME}/client`，运行 `sidecar --api=azure --cache=... --listen=127.0.0.1:18080`。KAITO 已负责注入，不要再开启 Racer webhook 的 `object-sidecar` 或 `client-socket` 注入标签。endpoint 仅 Pod 内可见，无 Service/Ingress；HTTP 路径是 **`/<container>/<blob-key>`**，不是只有 blob key。
+下面将测试 Workspace 固定到已核验节点的 hostname 标签，不依赖泛化的 `apps` 标签。节点必须同时有 `kaito.sh/racer-nvme=true`。如果该节点不满足资源需求就停止，不能假设 KAITO 新建节点自带已审核磁盘和缓存。
 
-在每个推理 Pod 的应用容器内，用 Python 做一次真实范围读取（替换实际 blob key，不下载整个权重）：
+### 5.2 串行执行直接 Azure、Racer 首次加载和热加载
+
+| CASE | `kaito.sh/model-cache` | 目的 |
+| --- | --- | --- |
+| `azure` | `disabled` | 保留 ModelStreaming，直接 Azure 读取作为基线 |
+| `racer-first` | `racer` | 首次通过 Racer 加载；是否真正冷缓存须由指标证明 |
+| `racer-warm` | `racer` | 上一组退出后，用新 Pod 加载相同权重，验证缓存复用 |
+
+**每次只创建一组**，完成本节及 5.3–5.5、保存结果后才释放该测试 Workspace 的 GPU，继续下一组。不要修改运行中的 Workspace annotation 来切换路径，旧 StatefulSet 不一定更新所有字段。
+
+以下生成命令需要管理机已有 Python 3 和 PyYAML。先将示例中的身份准备好；这里只提取 Workspace，不重复 apply Namespace/ServiceAccount：
 
 ```bash
+export CASE=azure # 下一轮依次改为 racer-first、racer-warm
+export WS="racer-bench-$BENCH_ID-$CASE"
+export GPU_HOSTNAME=$(kubectl get node "$GPU_NODE" -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}')
+: "${GPU_HOSTNAME:?}"
+python3 - <<'PY' > "$RESULTS/$CASE.workspace.json"
+import json, os, yaml
+with open('examples/racer-model-streaming-poc.yaml') as f:
+    ws = next(d for d in yaml.safe_load_all(f) if d and d.get('kind') == 'Workspace')
+case = os.environ['CASE']
+assert case in ('azure', 'racer-first', 'racer-warm')
+ws['metadata']['name'] = os.environ['WS']
+ws['metadata']['namespace'] = os.environ['NS']
+ws['metadata']['labels'] = {'racer-benchmark-id': os.environ['BENCH_ID']}
+ws['metadata']['annotations']['kaito.sh/model-cache'] = 'disabled' if case == 'azure' else 'racer'
+ws['resource']['labelSelector']['matchLabels'] = {
+    'kubernetes.io/hostname': os.environ['GPU_HOSTNAME'], 'kaito.sh/racer-nvme': 'true'}
+ws['inference']['preset']['name'] = os.environ['MODEL']
+print(json.dumps(ws, indent=2))
+PY
+# 创建前保存 Racer/origin 指标快照，尤其是 racer-first；见下文。
+date -u +%FT%TZ > "$RESULTS/$CASE.apply-start.txt"
+kubectl create -f "$RESULTS/$CASE.workspace.json"
+kubectl -n "$NS" get workspace "$WS" -w
+```
+
+看到 Ready 后退出 watch，继续以下检查；若出现 Failed、调度失败或长时间未就绪，检查事件并停止该轮，不把重试后的加载标记成“冷启动”。模型首次 mirror/download 时间要单独记录；进行性能比较前，应确认相同 ModelMirror 已 Ready，并记录对象版本/ETag/大小，不能把下载到 Blob 的时间归入 Racer 加载性能。
+
+```bash
+kubectl -n "$NS" get pods -l "kaito.sh/workspace=$WS" -o wide
+kubectl -n "$NS" get workspace "$WS" -o yaml > "$RESULTS/$CASE.workspace-state.yaml"
+kubectl -n "$NS" get pods -l "kaito.sh/workspace=$WS" -o json > "$RESULTS/$CASE.pods.json"
+kubectl -n "$NS" get events --sort-by=.lastTimestamp > "$RESULTS/$CASE.events.txt"
 export POD=YOUR_INFERENCE_POD APP_CONTAINER=YOUR_INFERENCE_CONTAINER
+kubectl -n "$NS" logs "$POD" -c "$APP_CONTAINER" --timestamps > "$RESULTS/$CASE.runtime.log"
+```
+
+逐一检查**全部 rank**：模型、dtype/量化、并行度、vLLM 参数、GPU 型号一致。Racer runtime 应基于与 Azure 基线相同的 base **digest** 构建，记录各应用镜像的实际 `imageID` 和 vLLM/runai-model-streamer 版本；不能拿 `0.7.1` 普通 runtime 与基于 `0.6.3` 的 Racer runtime 得出缓存加速比。未对齐时只能报告各自功能验证结果。
+
+Racer 两组必须有正确 provider env 和 `racer-object` native sidecar（`restartPolicy: Always`），挂载 `/run/racer/${CACHE_NAME}/client`，运行 `sidecar --api=azure --cache=... --listen=127.0.0.1:18080`。Azure 组应走直接 Azure，而非 Racer/本地完整权重缓存；不要关闭 ModelStreaming。不要再开启 Racer webhook 的重复注入标签。
+
+**记录启动时间和缓存证据：**
+- 从保存的 Pod JSON 取 `metadata.creationTimestamp`、`PodScheduled`/`Ready` condition 的 `lastTransitionTime`；Pod 创建→Ready 是端到端时间，不是纯模型加载时间。
+- 用 timestamped runtime 日志中的加载开始/完成信息计算模型加载耗时；镜像拉取、调度、镜像准备、CUDA/JIT、HTTP server 启动等分别说明，不将总启动差值全部归因于存储。
+- 每轮开始前和结束后保存 Racer/origin 的实际监控快照及对应节点 dataplane/sidecar 日志；使用所部署版本真实提供的指标名，比较 origin 读取字节、请求/错误和缓存命中变化。计数器重启清零或其他客户端流量会污染差值。
+- `racer-first` 只有在权重未被预读、缓存未命中且有 origin 读取证据时才算冷缓存；无法证明则标记 `cache-state=unknown`。Range 预读放在加载测量之后。**不清空/格式化共享 NVMe，不删除共享 cache、ModelMirror 或 identity 来制造冷缓存。**
+- `racer-warm` 保留同一节点/缓存/不可变对象，但必须重新创建推理 Pod。若命中证据不足或容量不足发生淘汰，不能宣称热缓存加速。
+
+### 5.3 发送真实推理请求
+
+在单独终端执行，只绑定本机，退出或切换 CASE 时用 Ctrl-C 停止：
+
+```bash
+kubectl -n "$NS" port-forward --address 127.0.0.1 "pod/$POD" 18000:5000
+```
+
+在原终端查询模型 ID 并请求推理（5000 是 KAITO runtime 默认 HTTP 端口，先核对实际 Pod）：
+
+```bash
+export API=http://127.0.0.1:18000
+curl --fail --silent --show-error "$API/v1/models" > "$RESULTS/$CASE.models.json"
+export SERVED_MODEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"][0]["id"])' "$RESULTS/$CASE.models.json")
+python3 - <<'PY' > "$RESULTS/$CASE.request.json"
+import json, os
+print(json.dumps({'model': os.environ['SERVED_MODEL'], 'messages': [
+    {'role': 'user', 'content': 'What is 17 + 25? Answer the number, then explain briefly.'}],
+    'temperature': 0, 'max_tokens': 128}))
+PY
+curl --fail --silent --show-error --max-time 120 \
+  -H 'Content-Type: application/json' \
+  --data-binary "@$RESULTS/$CASE.request.json" "$API/v1/chat/completions" \
+  > "$RESULTS/$CASE.response.json"
+python3 - <<'PY'
+import json, os
+with open(os.path.join(os.environ['RESULTS'], os.environ['CASE'] + '.response.json')) as f:
+    r = json.load(f)
+text = r['choices'][0]['message']['content']
+assert text and '42' in text, r
+assert r['usage']['completion_tokens'] > 0, r
+print(text)
+print(r['usage'])
+PY
+```
+
+这是基础正确性检查，不是模型质量评测；不要要求三组输出逐字节相同。错误、空输出或不合理回答应先诊断，不能仅凭 HTTP 200 验收。
+
+### 5.4 测首响应延迟和生成吞吐
+
+以下小规模流式测试只依赖 Python 标准库，先运行 1 次预热，再分别以并发 1/4 发起 20 个请求，每个最多生成 128 tokens。它测**模型 Ready 后**的服务性能，不包含权重加载。正式负载测试应在获批时段增加样本量；20 次的 P95 仅作 smoke benchmark，不能作为生产 SLA。
+
+```bash
+cat > "$RESULTS/bench.py" <<'PY'
+import concurrent.futures, json, math, os, time, urllib.request
+
+api, model = os.environ['API'], os.environ['SERVED_MODEL']
+def request(i):
+    payload = {'model': model, 'messages': [{'role': 'user', 'content':
+        f'Request {i}: Explain how a hash table handles collisions and give an example.'}],
+        'temperature': 0, 'max_tokens': 128, 'stream': True,
+        'stream_options': {'include_usage': True}}
+    req = urllib.request.Request(api + '/v1/chat/completions',
+        data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+    start = time.perf_counter()
+    first = None
+    usage = None
+    done = False
+    text = ''
+    with urllib.request.urlopen(req, timeout=120) as response:
+        for raw in response:
+            if not raw.startswith(b'data:'):
+                continue
+            data = raw[5:].strip()
+            if data == b'[DONE]':
+                done = True
+                break
+            chunk = json.loads(data)
+            if chunk.get('error'):
+                raise RuntimeError(chunk['error'])
+            usage = chunk.get('usage') or usage
+            for choice in chunk.get('choices', []):
+                content = choice.get('delta', {}).get('content') or ''
+                if content:
+                    if first is None:
+                        first = time.perf_counter()
+                    text += content
+    end = time.perf_counter()
+    assert done and first is not None and text and usage, 'incomplete SSE or missing usage'
+    tokens = usage['completion_tokens']
+    assert tokens > 0
+    return {'request': i, 'ttft_s': first-start, 'latency_s': end-start,
+            'completion_tokens': tokens, 'output_tokens_per_s': tokens/(end-start)}
+
+def percentile(rows, key, p):
+    values = sorted(r[key] for r in rows)
+    return values[max(0, math.ceil(p*len(values))-1)]
+
+request(-1)  # 预热，不计入结果；每轮使用相同请求集合。
+concurrency = int(os.environ.get('CONCURRENCY', '1'))
+start = time.perf_counter()
+with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+    rows = list(pool.map(request, range(20)))
+wall = time.perf_counter() - start
+print(json.dumps({'case': os.environ['CASE'], 'concurrency': concurrency,
+    'requests': len(rows), 'wall_s': wall,
+    'ttft_p50_s': percentile(rows, 'ttft_s', .5),
+    'ttft_p95_s': percentile(rows, 'ttft_s', .95),
+    'latency_p95_s': percentile(rows, 'latency_s', .95),
+    'aggregate_output_tokens_per_s': sum(r['completion_tokens'] for r in rows)/wall,
+    'samples': rows}, indent=2))
+PY
+CONCURRENCY=1 python3 "$RESULTS/bench.py" > "$RESULTS/$CASE.c1.json"
+CONCURRENCY=4 python3 "$RESULTS/bench.py" > "$RESULTS/$CASE.c4.json"
+```
+
+这里 `ttft_s` 是客户端观察到的首个**非空 content chunk** 延迟；`output_tokens_per_s` 是包含 prefill/排队的请求端到端输出速率，不等于纯 decode tokens/s。并发场景使用 aggregate 吞吐，不能把各请求速率简单相加。若服务不支持 SSE usage，停止并适配其实际 API，不能用字符数冒充 token 数。
+
+三组使用相同客户端、请求集合、顺序和 prefix/KV/LMCache 配置，记录实际 token 数。port-forward 会引入额外延迟，以上用于同条件 smoke 对比；高负载结论应使用相同节点位置的集群内客户端。Racer 优化的是权重读取/冷启动，**不预期常驻 GPU 后稳态 tokens/s 必然提升**。
+
+### 5.5 补充读取验收、释放测试资源和汇总
+
+Racer 两组完成加载测量后，在每个 rank 的应用容器内做真实 Range 读取，验证 sidecar 路径和返回契约（HTTP 路径是 `/<container>/<blob-key>`）：
+
+```bash
 export BLOB_KEY=YOUR_ACTUAL_SAFETENSORS_BLOB_KEY
-kubectl -n kaito-workspace exec -i "$POD" -c "$APP_CONTAINER" -- \
+kubectl -n "$NS" exec -i "$POD" -c "$APP_CONTAINER" -- \
   python3 - "$CONTAINER" "$BLOB_KEY" <<'PY'
 import sys, urllib.parse, urllib.request
 path = '/' + urllib.parse.quote(sys.argv[1], safe='') + '/' + urllib.parse.quote(sys.argv[2], safe='/')
-r = urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18080' + path, headers={'Range': 'bytes=0-15'}), timeout=30)
+r = urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18080' + path,
+    headers={'Range': 'bytes=0-15'}), timeout=30)
 body = r.read()
 assert r.status == 206 and len(body) == 16
 assert r.headers['Content-Range'].startswith('bytes 0-15/')
@@ -384,8 +567,27 @@ print(r.status, r.headers['Content-Range'], body.hex())
 PY
 ```
 
-再验证模型 Ready/推理请求、冷读和热读的一致性、origin/sidecar 错误及缓存命中。403 排查 account/container 和 origin FIC/RBAC；503/hostPath 失败排查该 GPU 节点的 dataplane/socket；明确区分真实 NVMe 使用与 slab 回退。对比直接 Azure 时，使用同一模型/资源的新 Workspace 并设置 `kaito.sh/model-cache: disabled`；不清空/格式化磁盘，不删除共享 cache 或 identity。
+403 排查 account/container 和 origin FIC/RBAC；503/hostPath 失败排查目标节点 dataplane/socket。检查真正使用了审核过的 NVMe，没有文件 slab 回退；Ready 或单次 Range 成功不能替代完整模型读取证据。
+
+保存该轮日志/指标/推理结果后，停止 port-forward。**只有以下名称和标签都属于本次测试且允许删除时**才释放测试 Workspace；不删除 Namespace、ServiceAccount、ModelMirror、缓存或现有业务 Workspace：
+
+```bash
+case "$WS" in
+  "racer-bench-$BENCH_ID-azure"|"racer-bench-$BENCH_ID-racer-first"|"racer-bench-$BENCH_ID-racer-warm") ;;
+  *) echo 'Refusing to delete a non-benchmark Workspace' >&2; exit 1 ;;
+esac
+ACTUAL_ID=$(kubectl -n "$NS" get workspace "$WS" -o jsonpath='{.metadata.labels.racer-benchmark-id}')
+if [ "$ACTUAL_ID" != "$BENCH_ID" ]; then
+  echo 'Benchmark label mismatch; stop' >&2; exit 1
+fi
+kubectl -n "$NS" delete workspace "$WS" --wait=true --timeout=5m
+kubectl -n "$NS" get pods -l "kaito.sh/workspace=$WS" -o wide
+```
+
+确认关联推理 Pod 已退出、GPU 已释放，再回到 5.2 选择下一 CASE；不删除共享模型资源。若有获准暂停的原业务，三组结束后按事先保存的恢复方案恢复，并重新验证服务。
+
+最终按三组汇总：模型/对象版本、镜像和库版本、GPU、缓存状态证据、mirror/拉镜像耗时、Pod→Ready、模型加载耗时、TTFT P50/P95、端到端延迟 P95、aggregate tokens/s、实际输出 token 数、错误和 origin 字节增量。只有配置一致且冷/热状态有证据时才计算加载加速比；未实测的栏位填“未测”，不填写推算收益。
 
 ## 验证边界
 
-此前 PoC 记录过 Go controller/provider 单测、provider race、9 项真实 `.so` ABI 测试、控制器编译及 Helm 渲染；不代表这些检查在每次文档升级中均已重跑。本次 v0.27.0 升级核对了 tag 源码、发行包校验和、CLI 帮助、overrides 离线校验及 release BOM/公开镜像 manifest。源码中的 sidecar flags、`/run/racer/<cache>/client`、`/<container>/<blob>`、单 Range/206/Content-Range 契约仍与 provider 一致，无需改变 KAITO provider ABI；这不是运行真实 v0.27.0 dataplane 的集成测试。本次重跑的 controller/provider 普通单测、Helm lint/render、10 个存储解析 mock 场景及 Bash 语法检查通过；环境缺少 GNU Make 和 C compiler，无法重跑完整 Make 检查、race 或 `.so` ABI 测试。**仍未构建/推送这些 Docker 镜像，未安装集群，未验证 AKS NVMe、Azure WI、GPU 或缓存性能**。本地/mock 测试不能替代以上部署验收。
+此前 PoC 记录过 Go controller/provider 单测、provider race、9 项真实 `.so` ABI 测试、控制器编译及 Helm 渲染；不代表这些检查在每次文档升级中均已重跑。本次 v0.27.0 升级核对了 tag 源码、发行包校验和、CLI 帮助、overrides 离线校验及 release BOM/公开镜像 manifest。源码中的 sidecar flags、`/run/racer/<cache>/client`、`/<container>/<blob>`、单 Range/206/Content-Range 契约仍与 provider 一致，无需改变 KAITO provider ABI；这不是运行真实 v0.27.0 dataplane 的集成测试。本次重跑的 controller/provider 普通单测、Helm lint/render、10 个存储解析 mock 场景及 Bash 语法检查通过；环境缺少 GNU Make 和 C compiler，无法重跑完整 Make 检查、race 或 `.so` ABI 测试。后续集群检查已确认自定义 controller 镜像在运行，Racer DaemonSet 在补充 `sku=gpu:NoSchedule` toleration 后达到 `DESIRED=CURRENT=READY=1`；这些观察不代表镜像构建可复现性、NVMe 使用或 Azure origin 读取已验收。**本文新增的三组真实模型/性能流程尚未执行，没有性能结果。** 本地语法/mock 检查不能替代以上部署验收。
