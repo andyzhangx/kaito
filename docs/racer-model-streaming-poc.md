@@ -28,6 +28,7 @@ name = os.environ['MIRROR_NAME']
 mirror = get('-n', 'kaito-workspace', 'get', 'modelmirror', name)
 assert mirror['spec'].get('mode', 'Managed') == 'Managed', '需要 Managed mirror'
 assert mirror['status'].get('phase') == 'Ready', '先等待 mirror Ready'
+assert mirror['spec']['source']['modelID'] == 'Qwen/Qwen3-Coder-30B-A3B-Instruct', '请选择本次 Qwen 模型的 mirror'
 pvc = get('-n', 'kaito-workspace', 'get', 'pvc', name)
 assert pvc['status'].get('phase') == 'Bound', 'PVC 尚未 Bound'
 pv_name = pvc['spec'].get('volumeName')
@@ -354,7 +355,9 @@ helm upgrade "$KAITO_RELEASE" ./charts/kaito/workspace \
 
 ## 第五步：用真实模型验证推理和性能
 
-**验收目标是模型通过 Racer 加载并完成真实推理，不是只看 Workspace Ready 或一次 Range 请求。** 先用示例中的 `microsoft/Phi-4-mini-instruct` 在单张 A100 上跑通，再按需换成第一步已镜像的 Qwen3 等模型；三组对比必须使用相同模型、不可变权重及推理配置。
+**验收目标是模型通过 Racer 加载并完成真实推理，不是只看 Workspace Ready 或一次 Range 请求。** 本流程统一使用 `Qwen/Qwen3-Coder-30B-A3B-Instruct`，复用第一步该模型的 Ready ModelMirror；三组对比必须使用相同模型、不可变权重及推理配置。
+
+`A3B` 表示每个 token 约激活 3B 参数，不代表只需加载 3B 权重；未量化的约 30B 参数仅 BF16/FP16 权重就约需 60 GB，另需 KV cache 和 runtime 工作空间。示例保留单张 A100 80 GB 的 `Standard_NC24ads_A100_v4`；部署前核对实际显存、dtype、`max_model_len`、并发和 KV cache 配置，不直接使用模型最大上下文长度假定能装下。确认所构建 runtime 的 vLLM 支持该模型架构，并在三组中保持版本和参数一致。
 
 ### 5.1 准备模型、身份和空闲 GPU
 
@@ -363,7 +366,7 @@ helm upgrade "$KAITO_RELEASE" ./charts/kaito/workspace \
 ```bash
 export NS=kaito-workspace
 export GPU_NODE=YOUR_VERIFIED_IDLE_A100_NODE
-export MODEL=microsoft/Phi-4-mini-instruct
+export MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct
 export BENCH_ID=$(date -u +%Y%m%d%H%M%S)
 export RESULTS="$PWD/racer-results-$BENCH_ID"
 mkdir -p "$RESULTS"
