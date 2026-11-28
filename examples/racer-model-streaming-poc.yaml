@@ -1,7 +1,7 @@
 # POC TEMPLATE ONLY: replace identity and validate the preset/GPU size.
 # Qwen3-Coder has ~30B total weights, not 3B; verify VRAM, KV cache and context limits.
 # Install and authorize Racer independently using the deployment guide.
-# Controller values: racer-model-streaming-values.yaml (do NOT kubectl apply it).
+# Configure the existing controller with kubectl edit deployment; see guide step 4.
 apiVersion: v1
 kind: Namespace
 metadata:

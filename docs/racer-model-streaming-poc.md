@@ -331,27 +331,78 @@ docker push "$RACER_STREAMING_IMAGE"
 
 ## 第四步：配置现有 KAITO 控制器
 
-编辑 [values 示例](../examples/racer-model-streaming-values.yaml)：`namespace: kaito-workspace`，`account`/`container`/`cacheName` 使用前面的实际值；`runtimeImage` 填第三步推送的镜像；`objectImage` 使用与 server 同版本的公开 sidecar：
+本 PoC 直接使用 `kubectl edit deployment` 修改**现有** workspace 控制器的镜像和启动参数，不需要 Helm values 文件，也不新装第二份控制器。前提是普通 ModelMirror/streaming 所需的 CRD、RBAC、StorageClass 和 Workload Identity 已按 streaming guide 配置完成；编辑 Deployment 不会创建这些依赖，也不会安装 Racer 或创建 ClusterCache。
 
-```text
-ghcr.io/azure/racer-object@sha256:5c43d6c4dd2a18998568be84252040f88f6be7b93ec2e55fdf0ddeb8a92663ba
-```
+**先确认控制器的管理方式。** Helm 安装的 Deployment 可以临时手改，但后续 Helm upgrade/rollback 可能覆盖修改；由 AKS 托管 add-on、Operator 或 GitOps 管理时，修改还可能被自动恢复，应先通过其受支持的管理入口更新，不要与自动协调器反复争用。以下操作仅适用于允许手动维护的现有 Deployment。
 
-保留原有 Workload Identity、StorageClass 等 values。只升级**现有** workspace Helm release，不在托管控制器旁安装第二份；非 Helm/AKS 托管安装先按其受支持的更新方式切换自定义控制器。
+### 4.1 定位并备份现有 Deployment
 
 ```bash
-helm list -A
-export KAITO_RELEASE=YOUR_EXISTING_WORKSPACE_RELEASE
+kubectl get deployment -A
 export KAITO_CONTROLLER_NAMESPACE=YOUR_EXISTING_CONTROLLER_NAMESPACE
-helm get values "$KAITO_RELEASE" -n "$KAITO_CONTROLLER_NAMESPACE" -o yaml > /tmp/kaito-current-values.yaml
-helm upgrade "$KAITO_RELEASE" ./charts/kaito/workspace \
-  -n "$KAITO_CONTROLLER_NAMESPACE" \
-  -f /tmp/kaito-current-values.yaml -f examples/racer-model-streaming-values.yaml \
-  --set-string image.repository="$REGISTRY/workspace" --set-string image.tag="$VERSION" \
-  --wait --timeout=5m
+export KAITO_DEPLOYMENT=YOUR_EXISTING_WORKSPACE_CONTROLLER_DEPLOYMENT
+
+# Inspect container names, images and all existing arguments before editing.
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" get deployment "$KAITO_DEPLOYMENT" \
+  -o jsonpath='{range .spec.template.spec.containers[*]}{"Container: "}{.name}{"\nImage: "}{.image}{"\nArgs:\n"}{range .args[*]}{.}{"\n"}{end}{"\n"}{end}'
+export KAITO_CONTROLLER_CONTAINER=YOUR_EXISTING_CONTROLLER_CONTAINER_NAME
+
+KAITO_DEPLOYMENT_BACKUP=$(mktemp /tmp/kaito-controller-before.XXXXXX.yaml)
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" get deployment "$KAITO_DEPLOYMENT" -o yaml \
+  > "$KAITO_DEPLOYMENT_BACKUP"
+printf 'Deployment backup: %s\n' "$KAITO_DEPLOYMENT_BACKUP"
+
+# Print actual image references from step 3; kubectl edit does not expand shell variables.
+printf 'Controller image: %s\nRuntime image: %s\n' \
+  "$REGISTRY/workspace:$VERSION" "$RACER_STREAMING_IMAGE"
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" edit deployment "$KAITO_DEPLOYMENT"
 ```
 
-这里 `KAITO_CONTROLLER_NAMESPACE` 保持原安装值；不是要求移动控制器。values 文件是 Helm 输入，不能 `kubectl apply`。
+`KAITO_CONTROLLER_NAMESPACE` 保持原安装值，不是要求移动控制器；`KAITO_CONTROLLER_CONTAINER` 必须是上面确认的 workspace 控制器容器，不是同 Pod 中的其它 sidecar。
+
+### 4.2 修改控制器容器的 image 和 args
+
+在编辑器中找到 `spec.template.spec.containers` 下的**控制器容器**，完成以下三项修改。下面都是字段/列表项示例，**不是完整 Deployment，不能直接 `kubectl apply`，也不要用它们覆盖完整 args 数组**。
+
+1. **修改 `image`**：填第三步打印的实际控制器镜像，例如 `YOUR_REGISTRY/workspace:0.13.0-racer`。必须使用包含本分支实现的镜像；仅给旧控制器添加 `--racer-cache-bindings` 可能导致 unknown flag、无法启动。不要在编辑器中填写字面量 `$REGISTRY` 或 `$VERSION`。
+2. **修改已有的 `--feature-gates=...` 参数**：保留所有其它 gate 的值，把 `ModelMirror`、`ModelStreaming` 改为 `true`；缺少时追加到同一条参数中，不要新增重复的 `--feature-gates`。例如，**仅当原参数只有以下三个 gate 时**：
+
+   ```yaml
+   # Before
+   - --feature-gates=disableNodeAutoProvisioning=true,ModelMirror=false,ModelStreaming=false
+   # After (replace the old item; do not keep both)
+   - --feature-gates=disableNodeAutoProvisioning=true,ModelMirror=true,ModelStreaming=true
+   ```
+
+3. **添加或修改 `--racer-cache-bindings`**：下面整个单引号字符串是 `args` 中的**一项**。若已有该参数，保留其它 binding，将本 binding 合并到同一个 JSON 数组，不要增加第二条同名参数。
+
+   ```yaml
+   - '--racer-cache-bindings=[{"namespace":"kaito-workspace","account":"YOUR_ACTUAL_STORAGE_ACCOUNT","container":"YOUR_ACTUAL_MIRROR_CONTAINER","cacheName":"kaito-model-cache","objectImage":"ghcr.io/azure/racer-object@sha256:5c43d6c4dd2a18998568be84252040f88f6be7b93ec2e55fdf0ddeb8a92663ba","runtimeImage":"YOUR_REGISTRY/kaito-vllm-racer:0.13.0-racer","immutable":true}]'
+   ```
+
+   保存前替换所有占位符：
+   - `namespace` 是**模型 Workspace 的 namespace**，此例为 `kaito-workspace`，不是控制器或 Racer 所在的 namespace。
+   - `account` / `container` 使用第一步从 Ready ModelMirror 解析出的真实存储位置，`cacheName` 使用第二步已创建的 ClusterCache 名称。控制器按 Workspace namespace 和实际 account/container 匹配；启用 Racer 却无匹配项会报错。
+   - `objectImage` 是公开的 Racer v0.27.0 sidecar 镜像，保持与 Racer server 相同版本，不是 KAITO 控制器镜像。
+   - `runtimeImage` 填第三步打印的 `$RACER_STREAMING_IMAGE` **实际值**，即含 Racer provider 的推理镜像；也可使用该镜像对应的不可变 digest。不要填控制器镜像或普通未加入 provider 的 base 镜像，不使用 `latest`。
+   - `immutable: true` 是管理员承诺不覆盖已存在的模型 blob key，不会自动启用 Azure Blob 不可变策略。本 provider ABI 不携带 ETag；更新模型应使用新容器或 revision 前缀，避免命中旧缓存。
+
+**保留全部其它配置**，尤其是已有的 `--default-model-mirror-storage-class`、`--default-streaming-service-account`、其它启动参数、ServiceAccount、Workload Identity 标签/环境变量、镜像拉取配置和调度约束。开启 feature gates 并不让所有 Workspace 自动使用 Racer，具体 Workspace 仍需第五步的 `kaito.sh/model-cache: racer` annotation。
+
+### 4.3 检查控制器更新
+
+保存退出后，`image` / `args` 的 Pod template 变更会自动触发滚动更新，不需要额外 `rollout restart`。
+
+```bash
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" \
+  rollout status deployment/"$KAITO_DEPLOYMENT" --timeout=5m
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" get deployment "$KAITO_DEPLOYMENT" \
+  -o jsonpath='{range .spec.template.spec.containers[*]}{"Container: "}{.name}{"\nImage: "}{.image}{"\nArgs:\n"}{range .args[*]}{.}{"\n"}{end}{"\n"}{end}'
+kubectl -n "$KAITO_CONTROLLER_NAMESPACE" logs deployment/"$KAITO_DEPLOYMENT" \
+  -c "$KAITO_CONTROLLER_CONTAINER" --tail=100
+```
+
+确认新镜像/参数已生效，且没有 unknown flag、binding 校验失败或镜像拉取失败。失败时停止第五步，检查新 Pod 的 events/logs，并根据备份审阅恢复本次修改的字段。控制器 rollout 成功不等于模型已经通过 Racer 加载，仍需完成第五步的真实推理和性能验证。
 
 ## 第五步：用真实模型验证推理和性能
 
